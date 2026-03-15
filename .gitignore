@@ -1,0 +1,66 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Python build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Big data outputs
+output/
+outputs/
+data/
+datasets/
+tmp/
+temp/
+
+# Spark
+spark-warehouse/
+
+# Hadoop
+*.crc
+
+# Parquet / big files
+*.parquet
+*.csv
+*.tsv
+
+# Model files
+*.pkl
+*.joblib
+*.h5
+*.pt
+
+data/
+
+# jar files
+*.jar
+
+spark-defaults.conf

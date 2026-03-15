@@ -1,0 +1,65 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.10 and base dependencies including Java for PySpark
+RUN apt-get update && apt-get upgrade -yqq && apt-get install -yqq --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    curl \
+    wget \
+    ca-certificates \
+    postgresql-client \
+    procps \
+    default-jre-headless \
+    git && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+ENV PATH="$JAVA_HOME/bin:$PATH"
+
+# Install Poetry - added PATH before using poetry commands
+ENV POETRY_HOME=/opt/poetry
+ENV PATH="$POETRY_HOME/bin:$PATH"
+RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=$POETRY_HOME python3 - \
+    && poetry config virtualenvs.create false
+
+ENV DAGSTER_HOME=/opt/dagster/dagster_home/dagster-project
+RUN mkdir -p $DAGSTER_HOME
+WORKDIR $DAGSTER_HOME
+
+# Copy pyproject.toml and poetry.lock first
+COPY pyproject.toml poetry.lock ./
+
+# Ensure lock file matches pyproject before installing
+RUN poetry install --no-interaction --no-ansi --no-root
+
+# Install required packages
+RUN pip install --no-cache-dir \
+    pyspark==3.5.7 \
+    scikit-learn \
+    scikit-surprise \
+    mlflow \
+    pandas \
+    numpy \
+    scipy
+
+COPY dagster.yaml $DAGSTER_HOME
+
+# Copy requirements and config files
+COPY entrypoint.sh $DAGSTER_HOME
+RUN chmod +x entrypoint.sh
+
+EXPOSE 3000
+
+CMD ["./entrypoint.sh"]
