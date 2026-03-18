@@ -17,29 +17,29 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-  streamlit:
-    build:
-      context: .
-      dockerfile: Dockerfile.streamlit
-    container_name: streamlit
-    ports:
-      - "8501:8501" 
-    env_file: ./.env
-    environment:
-      - TRINO_HOST=trino
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB} 
-    volumes:
-      - ./streamlit:/app
-      - ./pipeline/utils:/app/pipeline/utils
-    depends_on:
-      trino:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    restart: on-failure
+  # streamlit:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.streamlit
+  #   container_name: streamlit
+  #   ports:
+  #     - "8501:8501" 
+  #   env_file: ./.env
+  #   environment:
+  #     - TRINO_HOST=trino
+  #     - POSTGRES_HOST=${POSTGRES_HOST}
+  #     - POSTGRES_USER=${POSTGRES_USER}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+  #     - POSTGRES_DB=${POSTGRES_DB} 
+  #   volumes:
+  #     - ./streamlit:/app
+  #     - ./pipeline/utils:/app/pipeline/utils
+  #   depends_on:
+  #     trino:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   restart: on-failure
   dagster:
     build:
       context: .
@@ -184,68 +184,69 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-  hive-metastore:
-    image: apache/hive:4.0.0
-    container_name: hive-metastore
-    env_file: ./.env
-    environment:
-      - SERVICE_NAME=metastore
-      - DB_DRIVER=postgres
-      - SERVICE_OPTS=-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${POSTGRES_DB} -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER} -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
-      # include both the versioned jar name and a common alias so the metastore finds the driver
-      - HIVE_AUX_JARS_PATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
-      - HADOOP_CLASSPATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
-      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
-      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
-    ports:
-      - "9083:9083"
-    volumes:
-      # Mount JDBC and Hadoop AWS JAR files
-      # also mount as a generic driver name (some Hive images expect this filename)
-      - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-42.7.8.jar:ro
-      - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:ro
-      - ./jars/hadoop-aws-3.3.6.jar:/opt/hive/lib/hadoop-aws.jar:ro
-      - ./jars/aws-java-sdk-bundle-1.12.262.jar:/opt/hive/lib/aws-java-sdk-bundle.jar:ro
-      # Mount hive configuration
-      - ./config/hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    restart: on-failure
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9083 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 60s
 
-  trino:
-    image: trinodb/trino:latest
-    container_name: trino
-    env_file: ./.env
-    environment:
-      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
-      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-    volumes:
-      - ./config/trino:/etc/trino
-      - ./data/trino:/data/trino
-      - ./jars/hadoop-aws-3.3.6.jar:/usr/lib/trino/plugin/delta-lake/hadoop-aws-3.3.6.jar:ro
-      - ./jars/aws-java-sdk-bundle-1.12.262.jar:/usr/lib/trino/plugin/delta-lake/aws-java-sdk-bundle-1.12.262.jar:ro
-    ports:
-      - "8090:8080"
-    depends_on:
-      minio:
-        condition: service_healthy
-      hive-metastore:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-    restart: on-failure
+  # hive-metastore:
+  #   image: apache/hive:4.0.0
+  #   container_name: hive-metastore
+  #   env_file: ./.env
+  #   environment:
+  #     - SERVICE_NAME=metastore
+  #     - DB_DRIVER=postgres
+  #     - SERVICE_OPTS=-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${POSTGRES_DB} -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER} -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+  #     # include both the versioned jar name and a common alias so the metastore finds the driver
+  #     - HIVE_AUX_JARS_PATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
+  #     - HADOOP_CLASSPATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
+  #     - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+  #     - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+  #   ports:
+  #     - "9083:9083"
+  #   volumes:
+  #     # Mount JDBC and Hadoop AWS JAR files
+  #     # also mount as a generic driver name (some Hive images expect this filename)
+  #     - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-42.7.8.jar:ro
+  #     - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:ro
+  #     - ./jars/hadoop-aws-3.3.6.jar:/opt/hive/lib/hadoop-aws.jar:ro
+  #     - ./jars/aws-java-sdk-bundle-1.12.262.jar:/opt/hive/lib/aws-java-sdk-bundle.jar:ro
+  #     # Mount hive configuration
+  #     - ./config/hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     minio:
+  #       condition: service_healthy
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "nc -z localhost 9083 || exit 1"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 60s
+
+  # trino:
+  #   image: trinodb/trino:latest
+  #   container_name: trino
+  #   env_file: ./.env
+  #   environment:
+  #     - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+  #     - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+  #   volumes:
+  #     - ./config/trino:/etc/trino
+  #     - ./data/trino:/data/trino
+  #     - ./jars/hadoop-aws-3.3.6.jar:/usr/lib/trino/plugin/delta-lake/hadoop-aws-3.3.6.jar:ro
+  #     - ./jars/aws-java-sdk-bundle-1.12.262.jar:/usr/lib/trino/plugin/delta-lake/aws-java-sdk-bundle-1.12.262.jar:ro
+  #   ports:
+  #     - "8090:8080"
+  #   depends_on:
+  #     minio:
+  #       condition: service_healthy
+  #     hive-metastore:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 30
+  #   restart: on-failure
 
 
   cloudbeaver:
@@ -261,30 +262,30 @@ services:
         condition: service_healthy
     restart: on-failure
 
-  metabase:
-    image: metabase/metabase:latest
-    container_name: metabase
-    ports:
-      - "3002:3000"
-    env_file: ./.env
-    environment:
-      MB_DB_TYPE: postgres
-      MB_DB_HOST: postgres 
-      MB_DB_PORT: 5432
-      MB_DB_DBNAME: ${METABASE_DB} 
-      MB_DB_USER: ${POSTGRES_USER}
-      MB_DB_PASS: ${POSTGRES_PASSWORD}
-      MB_ANONYMOUS_TRACKING: "false"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s 
-    restart: on-failure
+  # metabase:
+  #   image: metabase/metabase:latest
+  #   container_name: metabase
+  #   ports:
+  #     - "3002:3000"
+  #   env_file: ./.env
+  #   environment:
+  #     MB_DB_TYPE: postgres
+  #     MB_DB_HOST: postgres 
+  #     MB_DB_PORT: 5432
+  #     MB_DB_DBNAME: ${METABASE_DB} 
+  #     MB_DB_USER: ${POSTGRES_USER}
+  #     MB_DB_PASS: ${POSTGRES_PASSWORD}
+  #     MB_ANONYMOUS_TRACKING: "false"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 30s 
+  #   restart: on-failure
 
 volumes:
   postgres_data:
