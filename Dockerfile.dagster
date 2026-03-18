@@ -44,16 +44,6 @@ COPY pyproject.toml poetry.lock ./
 # Ensure lock file matches pyproject before installing
 RUN poetry install --no-interaction --no-ansi --no-root
 
-# Install required packages
-RUN pip install --no-cache-dir \
-    pyspark==3.5.7 \
-    scikit-learn \
-    scikit-surprise \
-    mlflow \
-    pandas \
-    numpy \
-    scipy
-
 COPY dagster.yaml $DAGSTER_HOME
 
 # Copy requirements and config files

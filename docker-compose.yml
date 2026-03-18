@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:latest
+    image: postgres:17
     container_name: postgres
     env_file: ./.env
     restart: on-failure
@@ -248,19 +248,18 @@ services:
   #     retries: 30
   #   restart: on-failure
 
-
-  cloudbeaver:
-    image: dbeaver/cloudbeaver:latest
-    container_name: cloudbeaver
-    env_file: ./.env
-    volumes:
-      - ./data/cloudbeaver:/opt/cloudbeaver/workspace
-    ports:
-      - "8978:8978"
-    depends_on:
-      trino:
-        condition: service_healthy
-    restart: on-failure
+  # cloudbeaver:
+  #   image: dbeaver/cloudbeaver:latest
+  #   container_name: cloudbeaver
+  #   env_file: ./.env
+  #   volumes:
+  #     - ./data/cloudbeaver:/opt/cloudbeaver/workspace
+  #   ports:
+  #     - "8978:8978"
+  #   depends_on:
+  #     trino:
+  #       condition: service_healthy
+  #   restart: on-failure
 
   # metabase:
   #   image: metabase/metabase:latest

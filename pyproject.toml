@@ -1,0 +1,47 @@
+[project]
+name = "filmrecommendation"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "buihuy13",email = "buiquochuytd@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "dagster (>=1.12.19,<2.0.0)",
+    "dagster-webserver (>=1.12.19,<2.0.0)",
+    "dagster-postgres (>=0.28.19,<0.29.0)",
+    "dagster-aws (>=0.28.19,<0.29.0)",
+    "pyspark (>=4.1.1,<5.0.0)",
+    "dagster-graphql",
+    "dagster-docker",
+    "dagster-dbt",
+    "boto3",
+    "s3fs",
+    "pyarrow",
+    "deltalake",
+    "pandas>=2.0.0,<3.0.0",
+    "numpy",
+    "python-dotenv",
+    "jsonlines",
+    "httpx>=0.27.0",
+    "minio",
+    "dbt-core",
+    "dbt-trino",
+    "scikit-learn",
+    "lightgbm",
+    "torch",
+    "transformers",
+    "sentence-transformers",
+    "matplotlib",
+    "seaborn",
+    "tqdm",
+    "textstat",
+    "mlflow",
+    "scipy"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
