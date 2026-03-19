@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<configuration>
+    <!-- S3A Configuration for MinIO -->
+    <property>
+        <name>fs.s3a.endpoint</name>
+        <value>http://minio:9000</value>
+        <description>MinIO endpoint</description>
+    </property>
+    
+    <property>
+        <name>fs.s3a.access.key</name>
+        <value>admin</value>
+        <description>MinIO access key</description>
+    </property>
+    
+    <property>
+        <name>fs.s3a.secret.key</name>
+        <value>admin123</value>
+        <description>MinIO secret key</description>
+    </property>
+    
+    <property>
+        <name>fs.s3a.path.style.access</name>
+        <value>true</value>
+        <description>Enable path-style access for MinIO</description>
+    </property>
+    
+    <property>
+        <name>fs.s3a.connection.ssl.enabled</name>
+        <value>false</value>
+        <description>Disable SSL for MinIO</description>
+    </property>
+    
+    <property>
+        <name>fs.s3a.impl</name>
+        <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+        <description>S3A filesystem implementation</description>
+    </property>
+    
+    <property>
+        <name>fs.s3.impl</name>
+        <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+        <description>Map s3:// scheme to S3A filesystem</description>
+    </property>
+    
+    <!-- Additional S3A settings for better compatibility -->
+    <property>
+        <name>fs.s3a.aws.credentials.provider</name>
+        <value>org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider</value>
+        <description>Use simple credentials provider</description>
+    </property>
+    
+    <property>
+        <name>fs.s3a.connection.maximum</name>
+        <value>100</value>
+        <description>Maximum number of HTTP connections</description>
+    </property>
+</configuration>
