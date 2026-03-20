@@ -290,22 +290,20 @@ services:
       retries: 5
   
   #Vector database
-  # qdrant:
-  #   image: qdrant/qdrant:latest
-  #   container_name: qdrant
-  #   restart: on-failure
-  #   ports:
-  #     - "6333:6333"   # REST API
-  #     - "6334:6334"   # gRPC
-  #   volumes:
-  #     - ./data/qdrant:/qdrant/storage
-  #   environment:
-  #     - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 10
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: on-failure
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat /dev/null > /dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
   postgres_data:
