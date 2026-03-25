@@ -187,67 +187,67 @@ services:
       timeout: 5s
       retries: 5
 
-  hive-metastore:
-    image: apache/hive:4.0.0
-    container_name: hive-metastore
-    env_file: ./.env
-    environment:
-      - SERVICE_NAME=metastore
-      - DB_DRIVER=postgres
-      - SERVICE_OPTS=-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${HIVE_DB} -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER} -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
-      # include both the versioned jar name and a common alias so the metastore finds the driver
-      - HIVE_AUX_JARS_PATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
-      - HADOOP_CLASSPATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
-      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
-      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
-    ports:
-      - "9083:9083"
-    volumes:
-      # Mount JDBC and Hadoop AWS JAR files
-      # also mount as a generic driver name (some Hive images expect this filename)
-      - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-42.7.8.jar:ro
-      - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:ro
-      - ./jars/hadoop-aws-3.3.6.jar:/opt/hive/lib/hadoop-aws.jar:ro
-      - ./jars/aws-java-sdk-bundle-1.12.262.jar:/opt/hive/lib/aws-java-sdk-bundle.jar:ro
-      # Mount hive configuration
-      - ./config/hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    restart: on-failure
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c 'cat /dev/null > /dev/tcp/localhost/9083'"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 120s
+  # hive-metastore:
+  #   image: apache/hive:4.0.0
+  #   container_name: hive-metastore
+  #   env_file: ./.env
+  #   environment:
+  #     - SERVICE_NAME=metastore
+  #     - DB_DRIVER=postgres
+  #     - SERVICE_OPTS=-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${HIVE_DB} -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER} -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+  #     # include both the versioned jar name and a common alias so the metastore finds the driver
+  #     - HIVE_AUX_JARS_PATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
+  #     - HADOOP_CLASSPATH=/opt/hive/lib/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
+  #     - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+  #     - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+  #   ports:
+  #     - "9083:9083"
+  #   volumes:
+  #     # Mount JDBC and Hadoop AWS JAR files
+  #     # also mount as a generic driver name (some Hive images expect this filename)
+  #     - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-42.7.8.jar:ro
+  #     - ./jars/postgresql-42.7.8.jar:/opt/hive/lib/postgresql-driver.jar:ro
+  #     - ./jars/hadoop-aws-3.3.6.jar:/opt/hive/lib/hadoop-aws.jar:ro
+  #     - ./jars/aws-java-sdk-bundle-1.12.262.jar:/opt/hive/lib/aws-java-sdk-bundle.jar:ro
+  #     # Mount hive configuration
+  #     - ./config/hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     minio:
+  #       condition: service_healthy
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "bash -c 'cat /dev/null > /dev/tcp/localhost/9083'"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 20
+  #     start_period: 120s
 
-  trino:
-    image: trinodb/trino:latest
-    container_name: trino
-    env_file: ./.env
-    environment:
-      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
-      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-    volumes:
-      - ./config/trino:/etc/trino
-      - ./data/trino:/data/trino
-      - ./jars/hadoop-aws-3.3.6.jar:/usr/lib/trino/plugin/delta-lake/hadoop-aws-3.3.6.jar:ro
-      - ./jars/aws-java-sdk-bundle-1.12.262.jar:/usr/lib/trino/plugin/delta-lake/aws-java-sdk-bundle-1.12.262.jar:ro
-    ports:
-      - "8090:8080"
-    depends_on:
-      minio:
-        condition: service_healthy
-      hive-metastore:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
+  # trino:
+  #   image: trinodb/trino:latest
+  #   container_name: trino
+  #   env_file: ./.env
+  #   environment:
+  #     - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+  #     - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+  #   volumes:
+  #     - ./config/trino:/etc/trino
+  #     - ./data/trino:/data/trino
+  #     - ./jars/hadoop-aws-3.3.6.jar:/usr/lib/trino/plugin/delta-lake/hadoop-aws-3.3.6.jar:ro
+  #     - ./jars/aws-java-sdk-bundle-1.12.262.jar:/usr/lib/trino/plugin/delta-lake/aws-java-sdk-bundle-1.12.262.jar:ro
+  #   ports:
+  #     - "8090:8080"
+  #   depends_on:
+  #     minio:
+  #       condition: service_healthy
+  #     hive-metastore:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 30
 
   metabase:
     image: metabase/metabase:latest
