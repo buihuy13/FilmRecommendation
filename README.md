@@ -9,3 +9,6 @@ hive-metastore: 9083:9083
 trino: 8090:8080
 cloudbeaver: 8978:8978
 metabase: 3002:3000
+
+
+chưa tải jars của delta lake và map vào dagster/spark - config và sửa các file trong layer để support delta lake

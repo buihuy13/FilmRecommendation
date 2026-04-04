@@ -7,10 +7,6 @@ RUN set -ex; \
     apt-get install -y python3 python3-pip; \
     rm -rf /var/lib/apt/lists/*
 
-# Copy JAR files
-COPY jars/hadoop-aws-3.3.6.jar /opt/spark/jars/
-COPY jars/aws-java-sdk-bundle-1.12.262.jar /opt/spark/jars/
-
 # Download Delta Lake JAR khớp
 RUN curl -fSL \
     https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar \

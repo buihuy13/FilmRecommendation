@@ -2,6 +2,6 @@ load_from:
   # Each item in this list represents a "code location".
   # Here, we're loading from a Python module named 'pipeline'.
   - python_module:
-      module_name: pipeline # Assumes your code is in a 'pipeline' directory with an __init__.py
+      module_name: pipeline.definitions # Assumes your code is in a 'pipeline' directory with an __init__.py
       # You might need to specify an attribute if your Definitions object isn't named 'defs'
       # attribute: my_definitions 
