@@ -70,6 +70,7 @@ def bronze_movies(context: AssetExecutionContext, spark_resource: SparkSessionRe
         .filter(col("id").rlike(r"^\d+$"))
         .withColumn("id", col("id").cast(IntegerType()))
         .withColumn("runtime", col("runtime").cast(FloatType()))
+        .filter(col("runtime").between(30, 300))
         .dropna(subset=["id", "title"])
         .dropDuplicates(["id"])
         .withColumn(
@@ -106,8 +107,6 @@ def bronze_movies(context: AssetExecutionContext, spark_resource: SparkSessionRe
 
 @asset(deps=[upload_csv_to_minio])
 def bronze_ratings(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
-    # Dùng repartition(16) trước dropDuplicates để data cùng key (userId, movieId) nằm chung partition → giảm shuffle khi dedup 26M rows.
-
     spark = spark_resource.get_session()
 
     ratings_df = spark.read.csv("s3a://landing/ratings.csv", header=True, inferSchema=False)
@@ -115,9 +114,9 @@ def bronze_ratings(context: AssetExecutionContext, spark_resource: SparkSessionR
 
     ratings_df = (
         ratings_df
-        .withColumn("userId",    col("userId").cast(IntegerType()))
-        .withColumn("movieId",   col("movieId").cast(IntegerType()))
-        .withColumn("rating",    col("rating").cast(FloatType()))
+        .withColumn("userId", col("userId").cast(IntegerType()))
+        .withColumn("movieId", col("movieId").cast(IntegerType()))
+        .withColumn("rating", col("rating").cast(FloatType()))
         .withColumn("timestamp", col("timestamp").cast(LongType()))
         # Repartition theo key trước dedup: data cùng (userId, movieId) được nhóm về cùng partition → tránh full shuffle khi dropDuplicates
         .repartition(16, "userId", "movieId")
