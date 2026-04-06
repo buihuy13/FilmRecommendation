@@ -1,5 +1,5 @@
 from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue
-from pyspark.sql.functions import col, from_json, transform, regexp_replace
+from pyspark.sql.functions import col, from_json, transform, regexp_replace, trim
 from pyspark.sql.types import (
     ArrayType, StringType, StructType, StructField,
     IntegerType, FloatType, LongType, DoubleType
@@ -82,6 +82,8 @@ def bronze_movies(context: AssetExecutionContext, spark_resource: SparkSessionRe
                 lambda g: g["name"],
             )
         )
+        .filter(col("overview").isNotNull() & (trim(col("overview")) != ""))
+        .withColumn("overview", trim(col("overview")))
         # Chỉ giữ các cột cần thiết cho downstream
         .select("id", "title", "genre_list", "release_date", "runtime", "overview")
     )

@@ -7,6 +7,19 @@ RUN set -ex; \
     apt-get install -y python3 python3-pip; \
     rm -rf /var/lib/apt/lists/*
 
+# Workers need dependencies when executing tasks
+RUN pip3 install --no-cache-dir \
+    pandas \
+    pyarrow \
+    sentence-transformers \
+    torch
+
+ENV SENTENCE_TRANSFORMERS_HOME=/opt/spark/models
+ENV TRANSFORMERS_CACHE=/opt/spark/models
+
+# Pre-download model lúc build, không phải lúc runtime
+RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 # Download Delta Lake JAR khớp
 RUN curl -fSL \
     https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar \
