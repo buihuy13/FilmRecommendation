@@ -33,19 +33,29 @@ def gold_als_model(context: AssetExecutionContext, spark_resource: SparkSessionR
     ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
         "userId", "movieId", "rating", "timestamp"
     )
+    user_means_df = ratings_df.groupBy("userId").agg(
+        F.avg("rating").alias("user_mean")
+    )
+
+    # Lưu vào s3 để hybrid rcm lấy và tính mean (tránh user bias)
+    user_means_df.write.mode("overwrite").parquet("s3a://gold/user_means/")
+
+    ratings_with_mean = ratings_df.join(user_means_df, "userId", "inner").withColumn(
+        "rating_norm", col("rating") - col("user_mean")
+    )
 
     # Memory-friendly split by global timestamp quantile to avoid heavy per-user windows.
     ts_cutoff = ratings_df.approxQuantile("timestamp", [0.8], 0.01)[0]
 
     train_df = (
-        ratings_df.filter(col("timestamp") <= F.lit(ts_cutoff))
-        .select("userId", "movieId", "rating")
+        ratings_with_mean.filter(col("timestamp") <= F.lit(ts_cutoff))
+        .select("userId", "movieId", "rating_norm")
         .repartition(16, "userId")
     )
 
     test_df = (
-        ratings_df.filter(col("timestamp") > F.lit(ts_cutoff))
-        .select("userId", "movieId", "rating")
+        ratings_with_mean.filter(col("timestamp") > F.lit(ts_cutoff))
+        .select("userId", "movieId", "rating", "user_mean", "rating_norm")
         .repartition(16, "userId")
     )
 
@@ -55,24 +65,27 @@ def gold_als_model(context: AssetExecutionContext, spark_resource: SparkSessionR
         rank=ALS_RANK,
         userCol="userId",
         itemCol="movieId",
-        ratingCol="rating",
+        ratingCol="rating_norm",
         coldStartStrategy="drop",
-        nonnegative=True,
+        nonnegative=False,
     )
     model = als.fit(train_df)
 
     test_for_eval = test_df.sample(False, EVAL_SAMPLE_FRACTION, seed=42)
     predictions = model.transform(test_for_eval)
+    predictions = predictions.withColumn(
+        "prediction_raw", col("prediction") + col("user_mean")
+    )
     evaluator = RegressionEvaluator(
         metricName="rmse",
         labelCol="rating",
-        predictionCol="prediction",
+        predictionCol="prediction_raw",
     )
     rmse = evaluator.evaluate(predictions)
 
     evaluated_rows = predictions.count()
     context.log.info(
-        f"ALS RMSE: {rmse:.4f} on {evaluated_rows} sampled holdout rows."
+        f"ALS RMSE: {rmse:.4f} on {evaluated_rows} sampled holdout rows (user-mean normalized)."
     )
 
     model.write().overwrite().save(ALS_MODEL_PATH)
@@ -82,6 +95,7 @@ def gold_als_model(context: AssetExecutionContext, spark_resource: SparkSessionR
             "rmse": MetadataValue.float(rmse),
             "evaluated_rows": MetadataValue.int(evaluated_rows),
             "model_path": MetadataValue.text(ALS_MODEL_PATH),
+            "user_means_path": MetadataValue.text("s3a://gold/user_means/"),
         }
     )
 
@@ -179,14 +193,35 @@ def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: 
     if not active_users:
         raise RuntimeError("No eligible users found to generate hybrid recommendations.")
 
+    user_means_df = spark.read.parquet("s3a://gold/user_means/")
+
     candidates_df = (
         model.recommendForUserSubset(active_users_df, HYBRID_TOP_K)
         .select("userId", F.explode("recommendations").alias("rec"))
         .select(
             "userId",
             col("rec.movieId").alias("movieId"),
-            col("rec.rating").alias("collab_score"),
+            col("rec.rating").alias("collab_score_norm"),
         )
+        .join(user_means_df, "userId", "left")
+        .withColumn("collab_score", col("collab_score_norm") + col("user_mean"))
+        .drop("collab_score_norm", "user_mean")
+    )
+
+    collab_stats = candidates_df.groupBy("userId").agg(
+        F.min("collab_score").alias("collab_min"),
+        F.max("collab_score").alias("collab_max"),
+    )
+    candidates_df = (
+        candidates_df.join(collab_stats, "userId", "left")
+        .withColumn(
+            "collab_score_norm",
+            F.when(col("collab_max") - col("collab_min") > 0,
+                (col("collab_score") - col("collab_min")) / (col("collab_max") - col("collab_min"))
+            ).otherwise(F.lit(1.0))
+        )
+        .drop("collab_min", "collab_max", "collab_score")
+        .withColumnRenamed("collab_score_norm", "collab_score")
     )
 
     user_history_rows = (

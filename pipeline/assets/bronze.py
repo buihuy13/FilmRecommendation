@@ -105,12 +105,14 @@ def bronze_movies(context: AssetExecutionContext, spark_resource: SparkSessionRe
         }
     )
 
-@asset(deps=[upload_csv_to_minio])
+@asset(deps=[upload_csv_to_minio, bronze_movies])
 def bronze_ratings(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
     ratings_df = spark.read.csv("s3a://landing/ratings.csv", header=True, inferSchema=False)
     context.log.info(f"Raw schema: {ratings_df.dtypes}")
+
+    links_df = spark.read.csv("s3a://landing/links.csv", header=True, inferSchema=False)
 
     ratings_df = (
         ratings_df
@@ -122,12 +124,35 @@ def bronze_ratings(context: AssetExecutionContext, spark_resource: SparkSessionR
         .repartition(16, "userId", "movieId")
     )
 
+    links_df = (
+        links_df
+        .withColumn("movieId", col("movieId").cast(IntegerType()))
+        .withColumn("tmdbId", col("tmdbId").cast(IntegerType()))
+        .select("movieId", "tmdbId")
+        .dropna(subset=["movieId", "tmdbId"])
+        .dropDuplicates(["movieId"])
+    )
+
+    # Map MovieLens movieId -> TMDb id so ratings align with movies_metadata.id
+    ratings_df = (
+        ratings_df.join(links_df, "movieId", "inner")
+        .withColumnRenamed("movieId", "movieId_ml")
+        .withColumnRenamed("tmdbId", "movieId")
+    )
+
     clean_df = (
         ratings_df
         .dropna(subset=["userId", "movieId", "rating"])
         .filter((col("rating") >= 0.5) & (col("rating") <= 5.0))
         .dropDuplicates(["userId", "movieId"])
     )
+
+    # Chỉ giữ ratings có movieId tồn tại
+    valid_movie_ids = (
+        spark.read.parquet("s3a://bronze/movies/")
+        .select(col("id").alias("movieId"))
+    )
+    clean_df = clean_df.join(valid_movie_ids, "movieId", "inner")
 
     # Cache để count() và write() dùng chung execution plan, tránh Spark recompute toàn bộ DAG 2 lần
     clean_df.cache()
