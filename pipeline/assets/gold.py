@@ -1,94 +1,125 @@
-from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue
-from pyspark.ml.recommendation import ALS
+from collections import defaultdict
+import os
+
+from dagster import AssetExecutionContext, MaterializeResult, MetadataValue, asset
 from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.sql.functions import col, row_number, percent_rank
-from pyspark.sql.window import Window
-import pyspark.sql.functions as F
+from pyspark.ml.recommendation import ALS, ALSModel
+from pyspark.sql import Window, functions as F
+from pyspark.sql.functions import col
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
+
 from pipeline.assets.bronze import bronze_ratings
 from pipeline.assets.silver import silver_genres_tfidf, silver_synopsis_embeddings
 from pipeline.resources.spark import SparkSessionResource
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-import os
-import numpy as np
+
+
+ALS_MODEL_PATH = "s3a://gold/als_model/"
+QDRANT_COLLECTION = "movies"
+QDRANT_BATCH_SIZE = 256
+HYBRID_TOP_K = 10
+HYBRID_MAX_USERS = 100
+HIGH_RATING_THRESHOLD = 4.0
+ALS_RANK = 20
+ALS_MAX_ITER = 5
+ALS_REG_PARAM = 0.1
+EVAL_SAMPLE_FRACTION = 0.2
+
 
 @asset(deps=[bronze_ratings])
 def gold_als_model(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
-    # Đọc bronze ratings
-    ratings_df = spark.read.parquet("s3a://bronze/ratings/")
+    ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
+        "userId", "movieId", "rating", "timestamp"
+    )
 
-    # Train/test split theo timestamp (không random để tránh data leakage)
-    # Sort by timestamp, dùng percent_rank để split 80/20
-    window = Window.orderBy("timestamp")
-    split_df = ratings_df.withColumn("rank", percent_rank().over(window))
+    # Memory-friendly split by global timestamp quantile to avoid heavy per-user windows.
+    ts_cutoff = ratings_df.approxQuantile("timestamp", [0.8], 0.01)[0]
 
-    train_df = split_df.filter(col("rank") < 0.8).drop("rank")
-    test_df = split_df.filter(col("rank") >= 0.8).drop("rank")
+    train_df = (
+        ratings_df.filter(col("timestamp") <= F.lit(ts_cutoff))
+        .select("userId", "movieId", "rating")
+        .repartition(16, "userId")
+    )
 
-    # ALS training
+    test_df = (
+        ratings_df.filter(col("timestamp") > F.lit(ts_cutoff))
+        .select("userId", "movieId", "rating")
+        .repartition(16, "userId")
+    )
+
     als = ALS(
-        maxIter=10,
-        regParam=0.1,
+        maxIter=ALS_MAX_ITER,
+        regParam=ALS_REG_PARAM,
+        rank=ALS_RANK,
         userCol="userId",
         itemCol="movieId",
         ratingCol="rating",
-        coldStartStrategy="drop"
+        coldStartStrategy="drop",
+        nonnegative=True,
     )
     model = als.fit(train_df)
 
-    # Evaluate trên test
-    predictions = model.transform(test_df)
+    test_for_eval = test_df.sample(False, EVAL_SAMPLE_FRACTION, seed=42)
+    predictions = model.transform(test_for_eval)
     evaluator = RegressionEvaluator(
         metricName="rmse",
         labelCol="rating",
-        predictionCol="prediction"
+        predictionCol="prediction",
     )
     rmse = evaluator.evaluate(predictions)
-    context.log.info(f"ALS RMSE: {rmse}")
 
-    # Lưu model
-    model.write().overwrite().save("s3a://gold/als_model/")
+    evaluated_rows = predictions.count()
+    context.log.info(
+        f"ALS RMSE: {rmse:.4f} on {evaluated_rows} sampled holdout rows."
+    )
+
+    model.write().overwrite().save(ALS_MODEL_PATH)
 
     return MaterializeResult(
         metadata={
             "rmse": MetadataValue.float(rmse),
-            "model_path": MetadataValue.text("s3a://gold/als_model/"),
+            "evaluated_rows": MetadataValue.int(evaluated_rows),
+            "model_path": MetadataValue.text(ALS_MODEL_PATH),
         }
     )
+
 
 @asset(deps=[silver_genres_tfidf, silver_synopsis_embeddings])
 def gold_qdrant_upsert(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
-    # Đọc movies bronze
-    movies_df = spark.read.parquet("s3a://bronze/movies/")
-    # Đọc silver features
-    genres_df = spark.read.parquet("s3a://silver/genres_tfidf/")
-    synopsis_df = spark.read.parquet("s3a://silver/synopsis_embeddings/")
-
-    # Join để có full data
-    full_df = movies_df.join(genres_df, "id").join(synopsis_df, "id")
-
-    # Qdrant client
-    client = QdrantClient(url=os.getenv("QDRANT_URL", "http://qdrant:6333"))
-
-    # Tạo collection nếu chưa có
-    client.recreate_collection(
-        collection_name="movies",
-        vectors_config={
-            "genre_tfidf": VectorParams(size=1000, distance=Distance.COSINE),
-            "synopsis_embedding": VectorParams(size=384, distance=Distance.COSINE),  # all-MiniLM-L6-v2 is 384 dim
-        }
+    movies_df = spark.read.parquet("s3a://bronze/movies/").select(
+        "id", "title", "genre_list", "release_date", "runtime", "overview"
+    )
+    genres_df = spark.read.parquet("s3a://silver/genres_tfidf/").select(
+        "id", "genre_tfidf"
+    )
+    synopsis_df = spark.read.parquet("s3a://silver/synopsis_embeddings/").select(
+        "id", "synopsis_embedding"
     )
 
-    # Upsert theo batch 500
-    points = []
-    batch_size = 500
+    full_df = (
+        movies_df.join(genres_df, "id", "inner")
+        .join(synopsis_df, "id", "inner")
+        .repartition(8)
+    )
+
+    client = QdrantClient(url=os.getenv("QDRANT_URL", "http://qdrant:6333"))
+    client.delete_collection(collection_name=QDRANT_COLLECTION)
+    client.create_collection(
+        collection_name=QDRANT_COLLECTION,
+        vectors_config={
+            "genre_tfidf": VectorParams(size=1000, distance=Distance.COSINE),
+            "synopsis_embedding": VectorParams(size=384, distance=Distance.COSINE),
+        },
+    )
+
+    points: list[PointStruct] = []
     count = 0
 
-    for row in full_df.collect():
+    for row in full_df.toLocalIterator():
         payload = {
             "id": row["id"],
             "title": row["title"],
@@ -98,108 +129,163 @@ def gold_qdrant_upsert(context: AssetExecutionContext, spark_resource: SparkSess
             "overview": row["overview"],
         }
         vectors = {
-            "genre_tfidf": row["genre_tfidf"].toArray().tolist(),  # SparseVector to list
+            "genre_tfidf": row["genre_tfidf"].toArray().tolist(),
             "synopsis_embedding": row["synopsis_embedding"],
         }
         points.append(PointStruct(id=row["id"], payload=payload, vector=vectors))
 
-        if len(points) >= batch_size:
-            client.upsert(collection_name="movies", points=points)
+        if len(points) >= QDRANT_BATCH_SIZE:
+            client.upsert(collection_name=QDRANT_COLLECTION, points=points)
             count += len(points)
             points = []
-            context.log.info(f"Upserted {count} points")
+            context.log.info(f"Upserted {count} points into Qdrant")
 
-    # Upsert remaining
     if points:
-        client.upsert(collection_name="movies", points=points)
+        client.upsert(collection_name=QDRANT_COLLECTION, points=points)
         count += len(points)
 
-    context.log.info(f"Total upserted: {count}")
+    context.log.info(f"Finished Qdrant upsert: {count} points")
 
     return MaterializeResult(
         metadata={
-            "collection": MetadataValue.text("movies"),
+            "collection": MetadataValue.text(QDRANT_COLLECTION),
             "points_upserted": MetadataValue.int(count),
         }
     )
 
+
 @asset(deps=[gold_als_model, gold_qdrant_upsert])
 def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
+    model = ALSModel.load(ALS_MODEL_PATH)
 
-    # Load ALS model
-    from pyspark.ml.recommendation import ALSModel
-    model = ALSModel.load("s3a://gold/als_model/")
+    ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
+        "userId", "movieId", "rating", "timestamp"
+    )
 
-    # Đọc ratings
-    ratings_df = spark.read.parquet("s3a://bronze/ratings/")
-
-    # Get collaborative recommendations (ALS predictions)
-    collab_recs = model.recommendForAllUsers(10)  # Top 10 per user
-
-    # For simplicity, compute for a sample user, e.g., userId=1
-    # In real, loop over users or something
-    user_id = 1
-    user_collab = collab_recs.filter(col("userId") == user_id).select("recommendations").collect()[0]["recommendations"]
-
-    # Content-based: query Qdrant for similar movies based on user's rated movies
-    client = QdrantClient(url=os.getenv("QDRANT_URL", "http://qdrant:6333"))
-
-    # Get user's rated movies
-    user_ratings = ratings_df.filter(col("userId") == user_id).select("movieId", "rating").collect()
-    high_rated = [r["movieId"] for r in user_ratings if r["rating"] >= 4.0]
-
-    if high_rated:
-        # Use synopsis embedding of first high-rated movie for search
-        query_vector = client.retrieve(collection_name="movies", ids=[high_rated[0]])[0].vector["synopsis_embedding"]
-        content_results = client.search(
-            collection_name="movies",
-            query_vector=query_vector,
-            vector_name="synopsis_embedding",
-            limit=10
+    active_users_df = (
+        ratings_df.groupBy("userId")
+        .agg(
+            F.max("timestamp").alias("last_timestamp"),
+            F.count("*").alias("interaction_count"),
         )
-        content_movie_ids = [r.id for r in content_results]
+        .filter(col("interaction_count") >= 5)
+        .orderBy(F.desc("last_timestamp"))
+        .limit(HYBRID_MAX_USERS)
+        .select("userId")
+    )
+
+    active_users = [row["userId"] for row in active_users_df.collect()]
+    if not active_users:
+        raise RuntimeError("No eligible users found to generate hybrid recommendations.")
+
+    candidates_df = (
+        model.recommendForUserSubset(active_users_df, HYBRID_TOP_K)
+        .select("userId", F.explode("recommendations").alias("rec"))
+        .select(
+            "userId",
+            col("rec.movieId").alias("movieId"),
+            col("rec.rating").alias("collab_score"),
+        )
+    )
+
+    user_history_rows = (
+        ratings_df.filter(col("userId").isin(active_users))
+        .filter(col("rating") >= HIGH_RATING_THRESHOLD)
+        .orderBy("userId", F.desc("rating"), F.desc("timestamp"))
+        .select("userId", "movieId")
+        .collect()
+    )
+
+    seed_movies: dict[int, int] = {}
+    for row in user_history_rows:
+        seed_movies.setdefault(row["userId"], row["movieId"])
+
+    client = QdrantClient(url=os.getenv("QDRANT_URL", "http://qdrant:6333"))
+    content_scores: dict[int, dict[int, float]] = defaultdict(dict)
+
+    for user_id, seed_movie_id in seed_movies.items():
+        retrieved = client.retrieve(
+            collection_name=QDRANT_COLLECTION,
+            ids=[seed_movie_id],
+            with_vectors=["synopsis_embedding"],
+        )
+        if not retrieved:
+            continue
+
+        query_vector = retrieved[0].vector.get("synopsis_embedding")
+        if query_vector is None:
+            continue
+
+        content_results = client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_vector,
+            using="synopsis_embedding",
+            limit=HYBRID_TOP_K * 2,
+            with_payload=False,
+        ).points
+
+        rank = 0
+        for result in content_results:
+            movie_id = int(result.id)
+            if movie_id == seed_movie_id:
+                continue
+            rank += 1
+            content_scores[user_id][movie_id] = 1.0 / rank
+            if rank >= HYBRID_TOP_K:
+                break
+
+    content_rows = [
+        (user_id, movie_id, score)
+        for user_id, movies in content_scores.items()
+        for movie_id, score in movies.items()
+    ]
+
+    if content_rows:
+        content_df = spark.createDataFrame(
+            content_rows, ["userId", "movieId", "content_score"]
+        )
     else:
-        content_movie_ids = []
+        content_df = spark.createDataFrame(
+            [],
+            "userId int, movieId int, content_score double",
+        )
 
-    # Hybrid scoring: α=0.6 for collaborative, 0.4 for content
-    alpha = 0.6
-    hybrid_scores = {}
+    hybrid_df = (
+        candidates_df.join(content_df, ["userId", "movieId"], "full_outer")
+        .fillna(0.0, subset=["collab_score", "content_score"])
+        .withColumn(
+            "hybrid_score",
+            F.lit(0.6) * col("collab_score") + F.lit(0.4) * col("content_score"),
+        )
+    )
 
-    # Collaborative scores
-    for rec in user_collab:
-        hybrid_scores[rec["movieId"]] = {"collab_score": rec["rating"], "content_score": 0.0}
+    rank_window = Window.partitionBy("userId").orderBy(
+        F.desc("hybrid_score"),
+        F.desc("collab_score"),
+        F.desc("content_score"),
+        col("movieId"),
+    )
+    final_df = (
+        hybrid_df.withColumn("rank", F.row_number().over(rank_window))
+        .filter(col("rank") <= HYBRID_TOP_K)
+        .drop("rank")
+    )
 
-    # Content scores (simplified, assume score from search)
-    for i, mid in enumerate(content_movie_ids):
-        score = 1.0 / (i + 1)  # Rank-based score
-        if mid in hybrid_scores:
-            hybrid_scores[mid]["content_score"] = score
-        else:
-            hybrid_scores[mid] = {"collab_score": 0.0, "content_score": score}
+    output_path = "s3a://gold/recommendations/hybrid/"
+    final_df.write.mode("overwrite").parquet(output_path)
 
-    # Combine
-    for mid in hybrid_scores:
-        collab = hybrid_scores[mid]["collab_score"]
-        content = hybrid_scores[mid]["content_score"]
-        hybrid_scores[mid]["hybrid_score"] = alpha * collab + (1 - alpha) * content
-
-    # Sort and save top 10
-    top_recs = sorted(hybrid_scores.items(), key=lambda x: x[1]["hybrid_score"], reverse=True)[:10]
-
-    # Save to file or something
-    recs_df = spark.createDataFrame([
-        (user_id, mid, scores["collab_score"], scores["content_score"], scores["hybrid_score"])
-        for mid, scores in top_recs
-    ], ["userId", "movieId", "collab_score", "content_score", "hybrid_score"])
-
-    recs_df.write.mode("overwrite").parquet(f"s3a://gold/recommendations/user_{user_id}/")
-
-    context.log.info(f"Hybrid recommendations for user {user_id} saved.")
+    users_written = final_df.select("userId").distinct().count()
+    rows_written = final_df.count()
+    context.log.info(
+        f"Saved {rows_written} hybrid recommendations for {users_written} active users."
+    )
 
     return MaterializeResult(
         metadata={
-            "user_id": MetadataValue.int(user_id),
-            "output_path": MetadataValue.text(f"s3a://gold/recommendations/user_{user_id}/"),
+            "users_written": MetadataValue.int(users_written),
+            "rows_written": MetadataValue.int(rows_written),
+            "output_path": MetadataValue.text(output_path),
+            "max_users_processed": MetadataValue.int(HYBRID_MAX_USERS),
         }
     )
