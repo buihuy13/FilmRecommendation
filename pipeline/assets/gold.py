@@ -18,8 +18,10 @@ ALS_MODEL_PATH = "s3a://gold/als_model/"
 QDRANT_COLLECTION = "movies"
 QDRANT_BATCH_SIZE = 256
 HYBRID_TOP_K = 10
-HYBRID_MAX_USERS = 100
+HYBRID_MAX_USERS = 1000
 HIGH_RATING_THRESHOLD = 4.0
+CONTENT_SEEDS_PER_USER = 3
+CONTENT_CANDIDATES_PER_SEED = HYBRID_TOP_K * 2
 ALS_RANK = 20
 ALS_MAX_ITER = 5
 ALS_REG_PARAM = 0.1
@@ -44,17 +46,37 @@ def gold_als_model(context: AssetExecutionContext, spark_resource: SparkSessionR
         "rating_norm", col("rating") - col("user_mean")
     )
 
-    # Memory-friendly split by global timestamp quantile to avoid heavy per-user windows.
-    ts_cutoff = ratings_df.approxQuantile("timestamp", [0.8], 0.01)[0]
+    # Per-user chronological split to reduce cold-start in test.
+    order_window = Window.partitionBy("userId").orderBy("timestamp", "movieId")
+    stats_window = Window.partitionBy("userId")
+
+    ranked_df = (
+        ratings_with_mean.withColumn("user_event_count", F.count("*").over(stats_window))
+        .withColumn("row_num", F.row_number().over(order_window))
+        .withColumn(
+            "eval_cutoff",
+            F.greatest(
+                F.lit(1),
+                F.least(
+                    F.col("user_event_count") - 1,
+                    F.floor(F.col("user_event_count") * F.lit(0.8)).cast("int"),
+                ),
+            ),
+        )
+    )
 
     train_df = (
-        ratings_with_mean.filter(col("timestamp") <= F.lit(ts_cutoff))
+        ranked_df.filter(
+            (col("user_event_count") == 1) | (col("row_num") <= col("eval_cutoff"))
+        )
         .select("userId", "movieId", "rating_norm")
         .repartition(16, "userId")
     )
 
     test_df = (
-        ratings_with_mean.filter(col("timestamp") > F.lit(ts_cutoff))
+        ranked_df.filter(
+            (col("user_event_count") >= 2) & (col("row_num") > col("eval_cutoff"))
+        )
         .select("userId", "movieId", "rating", "user_mean", "rating_norm")
         .repartition(16, "userId")
     )
@@ -232,43 +254,50 @@ def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: 
         .collect()
     )
 
-    seed_movies: dict[int, int] = {}
+    seed_movies: dict[int, list[int]] = {}
     for row in user_history_rows:
-        seed_movies.setdefault(row["userId"], row["movieId"])
+        user_id = row["userId"]
+        movie_id = row["movieId"]
+        seeds = seed_movies.setdefault(user_id, [])
+        if len(seeds) < CONTENT_SEEDS_PER_USER and movie_id not in seeds:
+            seeds.append(movie_id)
 
     client = QdrantClient(url=os.getenv("QDRANT_URL", "http://qdrant:6333"))
     content_scores: dict[int, dict[int, float]] = defaultdict(dict)
 
-    for user_id, seed_movie_id in seed_movies.items():
-        retrieved = client.retrieve(
-            collection_name=QDRANT_COLLECTION,
-            ids=[seed_movie_id],
-            with_vectors=["synopsis_embedding"],
-        )
-        if not retrieved:
-            continue
-
-        query_vector = retrieved[0].vector.get("synopsis_embedding")
-        if query_vector is None:
-            continue
-
-        content_results = client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=query_vector,
-            using="synopsis_embedding",
-            limit=HYBRID_TOP_K * 2,
-            with_payload=False,
-        ).points
-
-        rank = 0
-        for result in content_results:
-            movie_id = int(result.id)
-            if movie_id == seed_movie_id:
+    for user_id, seed_list in seed_movies.items():
+        for seed_movie_id in seed_list:
+            retrieved = client.retrieve(
+                collection_name=QDRANT_COLLECTION,
+                ids=[seed_movie_id],
+                with_vectors=["synopsis_embedding"],
+            )
+            if not retrieved:
                 continue
-            rank += 1
-            content_scores[user_id][movie_id] = 1.0 / rank
-            if rank >= HYBRID_TOP_K:
-                break
+
+            query_vector = retrieved[0].vector.get("synopsis_embedding")
+            if query_vector is None:
+                continue
+
+            content_results = client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=query_vector,
+                using="synopsis_embedding",
+                limit=CONTENT_CANDIDATES_PER_SEED,
+                with_payload=False,
+            ).points
+
+            rank = 0
+            for result in content_results:
+                movie_id = int(result.id)
+                if movie_id == seed_movie_id:
+                    continue
+                rank += 1
+                score = 1.0 / rank
+                prev = content_scores[user_id].get(movie_id)
+                content_scores[user_id][movie_id] = max(prev, score) if prev else score
+                if rank >= HYBRID_TOP_K:
+                    break
 
     content_rows = [
         (user_id, movie_id, score)
@@ -294,6 +323,7 @@ def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: 
             F.lit(0.6) * col("collab_score") + F.lit(0.4) * col("content_score"),
         )
     )
+
 
     rank_window = Window.partitionBy("userId").orderBy(
         F.desc("hybrid_score"),
