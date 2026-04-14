@@ -19,9 +19,9 @@ USER_MEANS_PATH = "s3a://gold/user_means/"
 HYBRID_RECS_PATH = "s3a://gold/recommendations/hybrid/"
 
 EVAL_SAMPLE_FRACTION = 0.2
-RECS_TOP_K = 10
+RECS_TOP_K = 20
 RECS_USER_SAMPLE = 1000
-HYBRID_RELEVANT_THRESHOLD = 3.5
+HYBRID_RELEVANT_THRESHOLD = 3.0
 
 
 def _chronological_test_df(ratings_df: DataFrame) -> DataFrame:
@@ -47,9 +47,7 @@ def _chronological_test_df(ratings_df: DataFrame) -> DataFrame:
 
 
 @asset(deps=[gold_als_model])
-def evaluate_als(
-    context: AssetExecutionContext, spark_resource: SparkSessionResource
-) -> MaterializeResult:
+def evaluate_als(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
     ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
@@ -126,9 +124,7 @@ def evaluate_als(
 
 
 @asset(deps=[gold_hybrid_recommendations])
-def evaluate_hybrid(
-    context: AssetExecutionContext, spark_resource: SparkSessionResource
-) -> MaterializeResult:
+def evaluate_hybrid(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
     ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
@@ -149,37 +145,46 @@ def evaluate_hybrid(
         "inner"
     ).count()
     context.log.info(f"Overlap giữa recommendations và test set: {overlap_count}")
-    eval_users_df = hybrid_df.select("userId").distinct()
+    test_users_df = full_test_df.select("userId").distinct()
+
+    relevant_df = (
+        full_test_df.filter(col("rating") >= HYBRID_RELEVANT_THRESHOLD)
+        .select("userId", col("movieId").alias("rel_movieId"))
+        .dropDuplicates(["userId", "rel_movieId"])
+    )
+
+    relevant_users_df = relevant_df.select("userId").distinct()
+
+    eval_users_df = (
+        hybrid_df.select("userId").distinct()
+        .join(test_users_df, "userId", "inner")
+        .join(relevant_users_df, "userId", "inner")
+    )
 
     # seen = toàn bộ ratings của eval_users KHÔNG nằm trong test set của họ
     # (= phần train của eval_users)
-    # seen_df = (
-    #     ratings_df.join(eval_users_df, "userId", "inner")   # chỉ lấy eval_users
-    #     .join(full_test_df, ["userId", "movieId"], "left_anti")  # bỏ test rows
-    #     .select("userId", "movieId")
-    #     .distinct()
-    # )
+    seen_df = (
+        ratings_df.join(eval_users_df, "userId", "inner")   # chỉ lấy eval_users
+        .join(full_test_df, ["userId", "movieId"], "left_anti")  # bỏ test rows
+        .select("userId", "movieId")
+        .distinct()
+    )
 
     # context.log.info(f"Seen pairs: {seen_df.count()}")
 
 
     # test_df dùng để tính relevant: chỉ cần test rows của eval_users
-    test_df = full_test_df.join(eval_users_df, "userId", "inner")
-
-    relevant_df = (
-        test_df.filter(col("rating") >= HYBRID_RELEVANT_THRESHOLD)
-        .select("userId", col("movieId").alias("rel_movieId"))
-        .dropDuplicates(["userId", "rel_movieId"])
-    )
+    #test_df = full_test_df.join(eval_users_df, "userId", "inner")
 
     context.log.info(f"Total relevant pairs: {relevant_df.count()}")
     context.log.info(f"Avg relevant per user:")
     relevant_df.groupBy("userId").count().agg(F.avg("count")).show()
 
     # Lọc ra những recommendations chưa được user xem trong train
-    # candidates_df = hybrid_df.join(seen_df, ["userId", "movieId"], "left_anti")
+    candidates_df = hybrid_df.join(seen_df, ["userId", "movieId"], "left_anti")
+    candidates_df = candidates_df.join(eval_users_df, "userId", "inner")
 
-    candidates_df = hybrid_df
+    #candidates_df = hybrid_df
 
     cand_count = candidates_df.count()
     cand_users = candidates_df.select("userId").distinct().count()

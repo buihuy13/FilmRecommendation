@@ -31,8 +31,8 @@ HYBRID_MAX_USERS = 1000
 HYBRID_ALPHA = 0.7
 HIGH_RATING_THRESHOLD = 3.0
 CONTENT_SEEDS_PER_USER = 10
-CONTENT_CANDIDATES_PER_SEED = HYBRID_TOP_K * 10
-COLLAB_CANDIDATES_PER_USER = HYBRID_TOP_K * 10
+CONTENT_CANDIDATES_PER_SEED = HYBRID_TOP_K * 15
+COLLAB_CANDIDATES_PER_USER = HYBRID_TOP_K * 15
 
 CONTENT_GENRE_WEIGHT = 0.3
 CONTENT_SYNOPSIS_WEIGHT = 0.7
@@ -148,9 +148,9 @@ def _upsert_rows(client: QdrantClient, full_df: DataFrame, context) -> int:
 
 # Hybrid helpers
 
-def _build_collab_candidates(model, active_users_df: DataFrame, user_means_df: DataFrame) -> DataFrame:
+def _build_collab_candidates(spark: SparkSession, model, active_users_df, user_means_df, user_seen: dict[int, set[int]]) -> DataFrame:
     candidates_df = (
-        model.recommendForUserSubset(active_users_df, COLLAB_CANDIDATES_PER_USER)
+        model.recommendForUserSubset(active_users_df, COLLAB_CANDIDATES_PER_USER * 2)
         .select("userId", F.explode("recommendations").alias("rec"))
         .select(
             "userId",
@@ -158,27 +158,65 @@ def _build_collab_candidates(model, active_users_df: DataFrame, user_means_df: D
             col("rec.rating").alias("_collab_raw"),
         )
         .join(user_means_df, "userId", "left")
+        # Đưa về score thật (score trước đã - mean)
         .withColumn("collab_score", col("_collab_raw") + col("user_mean"))
         .drop("_collab_raw", "user_mean")
     )
-    rank_w = Window.partitionBy("userId").orderBy(F.desc("collab_score"), col("movieId"))
-    return candidates_df.withColumn(
-        "collab_score",
-        1.0 / F.log2(F.row_number().over(rank_w) + F.lit(1.0)),
+
+    # Remove seen
+    seen_rows = [(uid, mid) for uid, mids in user_seen.items() for mid in mids]
+    seen_df = spark.createDataFrame(seen_rows, ["userId", "movieId"])
+    candidates_df = candidates_df.join(seen_df, ["userId", "movieId"], "left_anti")
+
+    # Z-score
+    mean_w = Window.partitionBy("userId")
+    mean_col = F.avg("collab_score").over(mean_w)
+    std_col = F.stddev_pop("collab_score").over(mean_w)
+
+    candidates_df = candidates_df.withColumn(
+        "collab_z",
+        F.when(
+            std_col > 0,
+            (col("collab_score") - mean_col) / std_col
+        ).otherwise(F.lit(0.0))
     )
 
+    # Optional clip
+    candidates_df = candidates_df.withColumn(
+        "collab_z",
+        F.when(col("collab_z") > 5, 5)
+         .when(col("collab_z") < -5, -5)
+         .otherwise(col("collab_z"))
+    )
 
-def _get_train_seed_movies(
-    ratings_df: DataFrame,
-    active_users: list[int],
-) -> dict[int, list[int]]:
+    # Sigmoid
+    candidates_df = candidates_df.withColumn(
+        "collab_score",
+        1 / (1 + F.exp(-col("collab_z")))
+    )
+
+    # Rank + limit
+    rank_w = Window.partitionBy("userId").orderBy(F.desc("collab_score"))
+
+    candidates_df = (
+        candidates_df.withColumn("rank", F.row_number().over(rank_w))
+        .filter(col("rank") <= COLLAB_CANDIDATES_PER_USER)
+        .drop("rank", "collab_z")
+    )
+
+    return candidates_df
+
+# Chưa normalize tránh user-bias
+def _get_train_seed_movies(ratings_df: DataFrame, active_users: list[int]) -> dict[int, list[int]]:
     ranked = _chronological_split(ratings_df.filter(col("userId").isin(active_users)))
     history_rows = (
         ranked.filter(col("row_num") <= col("eval_cutoff"))
+        # Sort theo rating cao, = rating thì sort theo timestamp -> ưu tiên rating cao và phim mới
         .orderBy("userId", F.desc("rating"), F.desc("timestamp"))
         .select("userId", "movieId")
         .collect()
     )
+    # Lấy top N movieId làm seed cho mỗi userId
     seed_movies: dict[int, list[int]] = {}
     for row in history_rows:
         seeds = seed_movies.setdefault(row["userId"], [])
@@ -186,13 +224,8 @@ def _get_train_seed_movies(
             seeds.append(row["movieId"])
     return seed_movies
 
-
-def _get_user_seen(
-    ratings_df: DataFrame,
-    user_means_df: DataFrame,
-    active_users: list[int],
-) -> dict[int, set[int]]:
-    """Chỉ lấy train portion (80% đầu) để không leak test items."""
+# Lấy các film và active_user đã xem
+def _get_user_seen(ratings_df: DataFrame, user_means_df: DataFrame, active_users: list[int]) -> dict[int, set[int]]:
     ranked = _chronological_split(
         ratings_df.filter(col("userId").isin(active_users))
         .join(user_means_df, "userId", "left")
@@ -211,17 +244,14 @@ def _get_user_seen(
     return user_seen
 
 
-def _build_content_scores(
-    client: QdrantClient,
-    seed_movies: dict[int, list[int]],
-    user_seen: dict[int, set[int]],
-) -> list[tuple[int, int, float]]:
+def _build_content_scores(client: QdrantClient, seed_movies: dict[int, list[int]], 
+                          user_seen: dict[int, set[int]]) -> list[tuple[int, int, float]]:
     content_scores: dict[int, dict[int, float]] = defaultdict(dict)
 
     for user_id, seed_list in seed_movies.items():
         seen = user_seen[user_id]
         for seed_movie_id in seed_list:
-            # ✅ Fix bug 1: request đủ cả 2 vectors
+            # Lấy vector của seed movie
             retrieved = client.retrieve(
                 collection_name=QDRANT_COLLECTION,
                 ids=[seed_movie_id],
@@ -243,6 +273,7 @@ def _build_content_scores(
             ]:
                 if vec is None:
                     continue
+                # Lấy top CONTENT_CANDIDATES_PER_SEED phim giống với seed
                 results = client.query_points(
                     collection_name=QDRANT_COLLECTION,
                     query=vec,
@@ -251,25 +282,22 @@ def _build_content_scores(
                     with_payload=False,
                 ).points
 
+                # Sử dụng rank-based scoring
                 rank = 0
                 for result in results:
                     movie_id = int(result.id)
                     if movie_id == seed_movie_id or movie_id in seen:
                         continue
                     rank += 1
-                    # Pure RR nhân weight — vì synopsis_weight + genre_weight = 1.0
-                    # nên score tối đa từ 1 seed = 1.0 (khi rank 1 ở cả 2 spaces)
                     rr_score = weight * (1.0 / math.log2(rank + 1.0))
                     seed_candidate_scores[movie_id] = (
                         seed_candidate_scores.get(movie_id, 0.0) + rr_score
                     )
 
-            # ✅ Fix bug 2: cộng dồn across seeds thay vì max
-            # Nhiều seeds cùng recommend một movie → tín hiệu mạnh hơn → score cao hơn
-            # Cap ở 1.0 để giữ đúng range [0, 1]
             for movie_id, score in seed_candidate_scores.items():
                 prev = content_scores[user_id].get(movie_id, 0.0)
-                content_scores[user_id][movie_id] = min(prev + score, 1.0)
+                # Cần normalize lại content score sau khi cộng dồn
+                content_scores[user_id][movie_id] = prev + score
 
     return [
         (user_id, movie_id, score)
@@ -277,17 +305,56 @@ def _build_content_scores(
         for movie_id, score in movies.items()
     ]
 
-
+# normalize lại content score về [0,1]
 def _build_content_df(spark: SparkSession, content_rows: list[tuple]) -> DataFrame:
-    if content_rows:
-        return spark.createDataFrame(content_rows, ["userId", "movieId", "content_score"])
-    return spark.createDataFrame([], "userId int, movieId int, content_score double")
+    if not content_rows:
+        return spark.createDataFrame([], "userId int, movieId int, content_score double")
+
+    df = spark.createDataFrame(content_rows, ["userId", "movieId", "content_score"])
+
+    # Window theo user
+    mean_w = Window.partitionBy("userId")
+
+    mean_col = F.avg("content_score").over(mean_w)
+    std_col = F.stddev_pop("content_score").over(mean_w)
+
+    # Z-score
+    df = df.withColumn(
+        "content_z",
+        F.when(
+            std_col > 0,
+            (col("content_score") - mean_col) / std_col
+        ).otherwise(F.lit(0.0))
+    )
+
+    # Optional clip
+    df = df.withColumn(
+        "content_z",
+        F.when(col("content_z") > 5, 5)
+         .when(col("content_z") < -5, -5)
+         .otherwise(col("content_z"))
+    )
+
+    # Sigmoid → [0,1]
+    df = df.withColumn(
+        "content_score",
+        1 / (1 + F.exp(-col("content_z")))
+    )
+
+    return df.drop("content_z")
 
 
 def _blend_and_rank(candidates_df: DataFrame, content_df: DataFrame) -> DataFrame:
+    all_candidates = candidates_df.select("userId", "movieId").union(content_df.select("userId", "movieId")).dropDuplicates()
     hybrid_df = (
-        candidates_df.join(content_df, ["userId", "movieId"], "left")
-        .fillna(0.0, subset=["content_score"])
+        #candidates_df
+        #.join(content_df, ["userId", "movieId"], "left")
+        #.union(content_df.select("userId", "movieId"))
+        all_candidates
+        .join(candidates_df, ["userId", "movieId"], "left")
+        .join(content_df, ["userId", "movieId"], "left")
+        .fillna(0.0)
+        #.fillna(0.0, subset=["content_score"])
         .withColumn(
             "hybrid_score",
             F.lit(HYBRID_ALPHA) * col("collab_score")
@@ -406,7 +473,8 @@ def gold_hybrid_recommendations(
             F.count("*").alias("interaction_count"),
         )
         .filter(col("interaction_count") >= 5)
-        .orderBy(F.desc("last_timestamp"))
+        .orderBy(F.rand(seed=42))
+        #.orderBy(F.desc("last_timestamp"))
         .limit(HYBRID_MAX_USERS)
         .select("userId")
     )
@@ -416,9 +484,9 @@ def gold_hybrid_recommendations(
             "No eligible users found to generate hybrid recommendations."
         )
 
-    candidates_df = _build_collab_candidates(model, active_users_df, user_means_df)
     seed_movies = _get_train_seed_movies(ratings_df, active_users)
     user_seen = _get_user_seen(ratings_df, user_means_df, active_users)
+    candidates_df = _build_collab_candidates(spark, model, active_users_df, user_means_df, user_seen)
     content_rows = _build_content_scores(client, seed_movies, user_seen)
     content_df = _build_content_df(spark, content_rows)
     final_df = _blend_and_rank(candidates_df, content_df)
