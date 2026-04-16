@@ -21,18 +21,18 @@ HYBRID_OUT_PATH = "s3a://gold/recommendations/hybrid/"
 QDRANT_COLLECTION = "movies"
 QDRANT_BATCH_SIZE = 256
 
-ALS_RANK = 20
-ALS_MAX_ITER = 5
+ALS_RANK = 50
+ALS_MAX_ITER = 15
 ALS_REG_PARAM = 0.1
 EVAL_SAMPLE_FRACTION = 0.2
 
 HYBRID_TOP_K = 20
-HYBRID_MAX_USERS = 1000
-HYBRID_ALPHA = 0.7
+HYBRID_MAX_USERS = 400
+HYBRID_ALPHA = 0.75
 HIGH_RATING_THRESHOLD = 3.0
 CONTENT_SEEDS_PER_USER = 10
-CONTENT_CANDIDATES_PER_SEED = HYBRID_TOP_K * 15
-COLLAB_CANDIDATES_PER_USER = HYBRID_TOP_K * 15
+CONTENT_CANDIDATES_PER_SEED = 500
+COLLAB_CANDIDATES_PER_USER = 1000
 
 CONTENT_GENRE_WEIGHT = 0.3
 CONTENT_SYNOPSIS_WEIGHT = 0.7
@@ -148,7 +148,8 @@ def _upsert_rows(client: QdrantClient, full_df: DataFrame, context) -> int:
 
 # Hybrid helpers
 
-def _build_collab_candidates(spark: SparkSession, model, active_users_df, user_means_df, user_seen: dict[int, set[int]]) -> DataFrame:
+def _build_collab_candidates(spark: SparkSession, model, active_users_df, 
+                            user_means_df, user_seen: dict[int, set[int]]) -> DataFrame:
     candidates_df = (
         model.recommendForUserSubset(active_users_df, COLLAB_CANDIDATES_PER_USER * 2)
         .select("userId", F.explode("recommendations").alias("rec"))
@@ -214,7 +215,7 @@ def _get_train_seed_movies(ratings_df: DataFrame, active_users: list[int]) -> di
         # Sort theo rating cao, = rating thì sort theo timestamp -> ưu tiên rating cao và phim mới
         .orderBy("userId", F.desc("rating"), F.desc("timestamp"))
         .select("userId", "movieId")
-        .collect()
+        .toLocalIterator()
     )
     # Lấy top N movieId làm seed cho mỗi userId
     seed_movies: dict[int, list[int]] = {}
@@ -236,7 +237,7 @@ def _get_user_seen(ratings_df: DataFrame, user_means_df: DataFrame, active_users
             (col("user_event_count") == 1) | (col("row_num") <= col("eval_cutoff"))
         )
         .select("userId", "movieId")
-        .collect()
+        .toLocalIterator()
     )
     user_seen: dict[int, set[int]] = defaultdict(set)
     for row in train_rows:
@@ -367,19 +368,18 @@ def _blend_and_rank(candidates_df: DataFrame, content_df: DataFrame) -> DataFram
         F.desc("content_score"),
         col("movieId"),
     )
-    return (
-        hybrid_df.withColumn("rank", F.row_number().over(rank_w))
-        .filter(col("rank") <= HYBRID_TOP_K)
-        .drop("rank")
-    )
+    # return (
+    #     hybrid_df.withColumn("rank", F.row_number().over(rank_w))
+    #     .filter(col("rank") <= HYBRID_TOP_K)
+    #     .drop("rank")
+    # )
+    return hybrid_df
 
 
 # Dagster assets
 
 @asset(deps=[bronze_ratings])
-def gold_als_model(
-    context: AssetExecutionContext, spark_resource: SparkSessionResource
-) -> MaterializeResult:
+def gold_als_model(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
     ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
@@ -415,9 +415,7 @@ def gold_als_model(
 
 
 @asset(deps=[silver_genres_tfidf, silver_synopsis_embeddings])
-def gold_qdrant_upsert(
-    context: AssetExecutionContext, spark_resource: SparkSessionResource
-) -> MaterializeResult:
+def gold_qdrant_upsert(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
     full_df = (
@@ -454,9 +452,7 @@ def gold_qdrant_upsert(
 
 
 @asset(deps=[gold_als_model, gold_qdrant_upsert])
-def gold_hybrid_recommendations(
-    context: AssetExecutionContext, spark_resource: SparkSessionResource
-) -> MaterializeResult:
+def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
     model = ALSModel.load(ALS_MODEL_PATH)
     client = QdrantClient(url=os.getenv("QDRANT_URL", "http://qdrant:6333"))
@@ -478,7 +474,7 @@ def gold_hybrid_recommendations(
         .limit(HYBRID_MAX_USERS)
         .select("userId")
     )
-    active_users = [row["userId"] for row in active_users_df.collect()]
+    active_users = [row.userId for row in active_users_df.limit(HYBRID_MAX_USERS).toLocalIterator()]
     if not active_users:
         raise RuntimeError(
             "No eligible users found to generate hybrid recommendations."
@@ -487,12 +483,14 @@ def gold_hybrid_recommendations(
     seed_movies = _get_train_seed_movies(ratings_df, active_users)
     user_seen = _get_user_seen(ratings_df, user_means_df, active_users)
     candidates_df = _build_collab_candidates(spark, model, active_users_df, user_means_df, user_seen)
+    candidates_df = candidates_df.filter(col("collab_score") > 0.2)
     content_rows = _build_content_scores(client, seed_movies, user_seen)
     content_df = _build_content_df(spark, content_rows)
     final_df = _blend_and_rank(candidates_df, content_df)
 
     final_df.write.mode("overwrite").parquet(HYBRID_OUT_PATH)
 
+    final_df.persist()
     users_written = final_df.select("userId").distinct().count()
     rows_written = final_df.count()
     context.log.info(

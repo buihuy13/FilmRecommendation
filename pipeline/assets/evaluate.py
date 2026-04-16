@@ -1,5 +1,3 @@
-from multiprocessing import context
-
 from dagster import AssetExecutionContext, MaterializeResult, MetadataValue, asset
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALSModel
@@ -7,40 +5,26 @@ from pyspark.sql import DataFrame, Window, functions as F
 from pyspark.sql.functions import col
 
 from pipeline.assets.gold import (
-    HYBRID_ALPHA,
+    ALS_MODEL_PATH,
+    HYBRID_OUT_PATH,
+    HYBRID_TOP_K,
+    HIGH_RATING_THRESHOLD,
+    USER_MEANS_PATH,
+    _chronological_split,
     gold_als_model,
     gold_hybrid_recommendations,
 )
 from pipeline.resources.spark import SparkSessionResource
 
 
-ALS_MODEL_PATH = "s3a://gold/als_model/"
-USER_MEANS_PATH = "s3a://gold/user_means/"
-HYBRID_RECS_PATH = "s3a://gold/recommendations/hybrid/"
-
+BRONZE_RATINGS_PATH = "s3a://bronze/ratings/"
 EVAL_SAMPLE_FRACTION = 0.2
-RECS_TOP_K = 20
+RECS_TOP_K = HYBRID_TOP_K
 RECS_USER_SAMPLE = 1000
-HYBRID_RELEVANT_THRESHOLD = 3.0
 
 
 def _chronological_test_df(ratings_df: DataFrame) -> DataFrame:
-    order_w = Window.partitionBy("userId").orderBy("timestamp", "movieId")
-    stats_w = Window.partitionBy("userId")
-    ranked = (
-        ratings_df.withColumn("user_event_count", F.count("*").over(stats_w))
-        .withColumn("row_num", F.row_number().over(order_w))
-        .withColumn(
-            "eval_cutoff",
-            F.greatest(
-                F.lit(1),
-                F.least(
-                    col("user_event_count") - 1,
-                    F.floor(col("user_event_count") * F.lit(0.8)).cast("int"),
-                ),
-            ),
-        )
-    )
+    ranked = _chronological_split(ratings_df)
     return ranked.filter(
         (col("user_event_count") >= 2) & (col("row_num") > col("eval_cutoff"))
     ).select("userId", "movieId", "rating", "timestamp")
@@ -50,7 +34,7 @@ def _chronological_test_df(ratings_df: DataFrame) -> DataFrame:
 def evaluate_als(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     spark = spark_resource.get_session()
 
-    ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
+    ratings_df = spark.read.parquet(BRONZE_RATINGS_PATH).select(
         "userId", "movieId", "rating", "timestamp"
     )
 
@@ -85,7 +69,7 @@ def evaluate_als(context: AssetExecutionContext, spark_resource: SparkSessionRes
     prediction_coverage = (eval_rows / test_rows) if test_rows else 0.0
 
     sample_users_df = (
-        ratings_df.select("userId").distinct().orderBy(F.rand()).limit(RECS_USER_SAMPLE)
+        ratings_df.select("userId").distinct().orderBy(F.rand(seed=42)).limit(RECS_USER_SAMPLE)
     )
     users_with_recs = (
         model.recommendForUserSubset(sample_users_df, RECS_TOP_K)
@@ -124,211 +108,218 @@ def evaluate_als(context: AssetExecutionContext, spark_resource: SparkSessionRes
 
 
 @asset(deps=[gold_hybrid_recommendations])
-def evaluate_hybrid(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
-    spark = spark_resource.get_session()
+def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
+    import random
 
-    ratings_df = spark.read.parquet("s3a://bronze/ratings/").select(
+    spark = spark_resource.get_session()
+    NUM_NEGATIVES = 99  # 1 relevant + 99 random negatives
+    SAMPLE_SEED = 42
+
+    ratings_df = spark.read.parquet(BRONZE_RATINGS_PATH).select(
         "userId", "movieId", "rating", "timestamp"
     )
-
-    full_test_df = _chronological_test_df(ratings_df).cache()
-
-    context.log.info(f"Full test rows: {full_test_df.count()}")
-
-    hybrid_df = spark.read.parquet(HYBRID_RECS_PATH).select(
+    hybrid_df = spark.read.parquet(HYBRID_OUT_PATH).select(
         "userId", "movieId", "hybrid_score"
     )
 
-    overlap_count = hybrid_df.join(
-        full_test_df.select("userId", "movieId"),
-        ["userId", "movieId"],
-        "inner"
-    ).count()
-    context.log.info(f"Overlap giữa recommendations và test set: {overlap_count}")
-    test_users_df = full_test_df.select("userId").distinct()
+    hybrid_users_df = hybrid_df.select("userId").distinct().cache()
+    if hybrid_users_df.rdd.isEmpty():
+        raise RuntimeError("No hybrid recommendations found to evaluate.")
 
-    relevant_df = (
-        full_test_df.filter(col("rating") >= HYBRID_RELEVANT_THRESHOLD)
-        .select("userId", col("movieId").alias("rel_movieId"))
-        .dropDuplicates(["userId", "rel_movieId"])
+    # Positive item phải đến từ phần holdout thật của gold, không lấy từ toàn bộ lịch sử.
+    full_test_df = (
+        _chronological_test_df(ratings_df)
+        .join(hybrid_users_df, "userId", "inner")
+        .filter(col("rating") >= HIGH_RATING_THRESHOLD)  # chỉ lấy item user thích
+        .cache()
+    )
+    test_rank_w = Window.partitionBy("userId").orderBy(
+        F.desc("rating"),
+        F.desc("timestamp"),
+        F.desc("movieId"),
+    )
+    test_item_df = (
+        full_test_df.withColumn("rn", F.row_number().over(test_rank_w))
+        .filter(col("rn") <= 3)
+        .select("userId", col("movieId").alias("test_movieId"))
+        .cache()
     )
 
-    relevant_users_df = relevant_df.select("userId").distinct()
+    eval_users_df = test_item_df.select("userId").cache()
+    context.log.info(f"Users có test item: {eval_users_df.count()}")
 
-    eval_users_df = (
-        hybrid_df.select("userId").distinct()
-        .join(test_users_df, "userId", "inner")
-        .join(relevant_users_df, "userId", "inner")
+    # Retrieval coverage
+    users_with_test = test_item_df.count()
+    positive_retrieved = (
+        test_item_df
+        .join(hybrid_df,
+              (test_item_df.userId == hybrid_df.userId) &
+              (test_item_df.test_movieId == hybrid_df.movieId),
+              "inner")
+        .count()
+    )
+    context.log.info(
+        f"Positive retrieved bởi model: {positive_retrieved}/{users_with_test} "
+        f"= {positive_retrieved/users_with_test:.4f}"
     )
 
-    # seen = toàn bộ ratings của eval_users KHÔNG nằm trong test set của họ
-    # (= phần train của eval_users)
-    seen_df = (
-        ratings_df.join(eval_users_df, "userId", "inner")   # chỉ lấy eval_users
-        .join(full_test_df, ["userId", "movieId"], "left_anti")  # bỏ test rows
+    # Negative pool loại toàn bộ item user từng rate, để tránh lấy nhầm positive khác làm negative.
+    all_rated_rows = (
+        ratings_df.join(eval_users_df, "userId", "inner")
         .select("userId", "movieId")
-        .distinct()
+        .collect()
+    )
+    user_rated: dict[int, set[int]] = {}
+    for row in all_rated_rows:
+        user_rated.setdefault(row["userId"], set()).add(row["movieId"])
+
+    all_movies = [row["movieId"] for row in ratings_df.select("movieId").distinct().collect()]
+    all_movies_set = set(all_movies)
+
+    # Build sampled candidate pool: 1 positive + 99 negatives per user
+    rng = random.Random(SAMPLE_SEED)
+    sample_rows = []
+    test_item_map = {
+        row["userId"]: row["test_movieId"]
+        for row in test_item_df.collect()
+    }
+
+    for user_id, test_movie_id in test_item_map.items():
+        rated = user_rated.get(user_id, set())
+        neg_pool = list(all_movies_set - rated - {test_movie_id})
+        if len(neg_pool) < NUM_NEGATIVES:
+            continue
+        negatives = rng.sample(neg_pool, NUM_NEGATIVES)
+        sample_rows.append((user_id, test_movie_id, 1))
+        for neg_id in negatives:
+            sample_rows.append((user_id, neg_id, 0))
+
+    candidate_pool_df = spark.createDataFrame(
+        sample_rows, ["userId", "movieId", "is_positive"]
+    ).cache()
+    context.log.info(f"Candidate pool: {candidate_pool_df.count()} rows")
+
+    # Vì gold chỉ lưu top-K cuối cùng, item không có score được coi là "không được retrieve".
+    scored_df = (
+        candidate_pool_df.alias("cand")
+        .join(hybrid_df, ["userId", "movieId"], "left")
+        .withColumn("has_score", F.when(col("hybrid_score").isNotNull(), 1).otherwise(0))
+        .cache()
     )
 
-    # context.log.info(f"Seen pairs: {seen_df.count()}")
-
-
-    # test_df dùng để tính relevant: chỉ cần test rows của eval_users
-    #test_df = full_test_df.join(eval_users_df, "userId", "inner")
-
-    context.log.info(f"Total relevant pairs: {relevant_df.count()}")
-    context.log.info(f"Avg relevant per user:")
-    relevant_df.groupBy("userId").count().agg(F.avg("count")).show()
-
-    # Lọc ra những recommendations chưa được user xem trong train
-    candidates_df = hybrid_df.join(seen_df, ["userId", "movieId"], "left_anti")
-    candidates_df = candidates_df.join(eval_users_df, "userId", "inner")
-
-    #candidates_df = hybrid_df
-
-    cand_count = candidates_df.count()
-    cand_users = candidates_df.select("userId").distinct().count()
-    context.log.info(f"Candidates sau lọc seen: {cand_count} rows, {cand_users} users")
-
-    rank_w = Window.partitionBy("userId").orderBy(
-        F.desc("hybrid_score"),
-        col("movieId"),  # tiebreaker deterministc
+    scored_rank_w = Window.partitionBy("userId").orderBy(
+        F.desc(F.coalesce(col("hybrid_score"), F.lit(-1.0))),
+        col("movieId"),
     )
 
-    k_recs_df = (
-        candidates_df.withColumn("rank", F.row_number().over(rank_w))
-        .filter(col("rank") <= RECS_TOP_K)
-        .select("userId", "movieId", "rank")
+    scored_ranked_df = (
+        scored_df
+        .withColumn("rank_in_pool", F.row_number().over(scored_rank_w))
+        .select("userId", "movieId", "rank_in_pool")
     )
 
-    krecs_count = k_recs_df.count()
-    krecs_users = k_recs_df.select("userId").distinct().count()
-    context.log.info(f"k_recs (top-{RECS_TOP_K}): {krecs_count} rows, {krecs_users} users")
-
-    hits_df = k_recs_df.join(
-        relevant_df,
-        (k_recs_df.userId == relevant_df.userId)
-        & (k_recs_df.movieId == relevant_df.rel_movieId),
-        "inner",
-    ).select(k_recs_df.userId, k_recs_df.movieId)
-
-    context.log.info(f"Total hits: {hits_df.count()}")
-
-
-    hit_counts = hits_df.groupBy("userId").agg(F.count("*").alias("hit_count"))
-    rel_counts = relevant_df.groupBy("userId").agg(F.count("*").alias("rel_count"))
-    rec_counts = k_recs_df.groupBy("userId").agg(F.count("*").alias("rec_count"))
-
-    metrics_df = (
-        eval_users_df
-        .join(rec_counts, "userId", "left")
-        .join(rel_counts, "userId", "left")
-        .join(hit_counts, "userId", "left")
-        .fillna(0, subset=["hit_count", "rel_count", "rec_count"])
-        .withColumn(
-            "precision_at_k",
-            F.when(col("rec_count") > 0, col("hit_count") / col("rec_count")).otherwise(0.0),
-        )
-        .withColumn(
-            "recall_at_k",
-            F.when(col("rel_count") > 0, col("hit_count") / col("rel_count")).otherwise(0.0),
-        )
-        .withColumn(
-            "hit_rate",
-            F.when(col("hit_count") > 0, 1.0).otherwise(0.0),
-        )
-    )
-
-    ranked_hits = (
-        k_recs_df.alias("recs")
-        .join(
-            relevant_df.alias("rel"),
-            (col("recs.userId") == col("rel.userId"))
-            & (col("recs.movieId") == col("rel.rel_movieId")),
+    positive_rank_df = (
+        test_item_df.join(
+            scored_ranked_df,
+            (test_item_df.userId == scored_ranked_df.userId)
+            & (test_item_df.test_movieId == scored_ranked_df.movieId),
             "left",
         )
         .select(
-            col("recs.userId"),
-            col("recs.rank"),
-            F.when(col("rel.rel_movieId").isNotNull(), 1.0).otherwise(0.0).alias("is_relevant"),
+            test_item_df.userId,
+            F.when(col("rank_in_pool").isNotNull(), col("rank_in_pool"))
+            .otherwise(F.lit(NUM_NEGATIVES + 1))
+            .alias("rank_in_pool"),
         )
+        .cache()
     )
 
-    dcg_df = (
-        ranked_hits.withColumn(
-            "dcg_contrib",
-            F.when(
-                col("is_relevant") > 0,
-                1.0 / F.log2(col("rank") + 1.0),
-            ).otherwise(0.0),
+    agg_row = (
+        positive_rank_df
+        .withColumn(
+            "hit_at_1",
+            F.when(col("rank_in_pool") <= 1, 1.0).otherwise(0.0),
         )
-        .groupBy("userId")
-        .agg(F.sum("dcg_contrib").alias("dcg"))
-    )
-
-    ideal_df = rel_counts.withColumn(
-        "ideal_dcg",
-        F.expr(
-            f"aggregate(sequence(1, least(rel_count, {RECS_TOP_K})), "
-            f"0.0D, (acc, x) -> acc + 1.0D / log2(x + 1))"
-        ),
-    )
-
-    ndcg_df = (
-        dcg_df.join(ideal_df, "userId", "left")
+        .withColumn(
+            "hit_at_5",
+            F.when(col("rank_in_pool") <= 5, 1.0).otherwise(0.0),
+        )
+        .withColumn(
+            "hit_at_10",
+            F.when(col("rank_in_pool") <= 10, 1.0).otherwise(0.0),
+        )
+        .withColumn(
+            "hit_at_20",
+            F.when(col("rank_in_pool") <= RECS_TOP_K, 1.0).otherwise(0.0),
+        )
         .withColumn(
             "ndcg_at_k",
-            F.when(col("ideal_dcg") > 0, col("dcg") / col("ideal_dcg")).otherwise(0.0),
+            F.when(
+                col("rank_in_pool") <= RECS_TOP_K,
+                1.0 / F.log2(col("rank_in_pool") + 1.0),
+            ).otherwise(0.0),
         )
-        .select("userId", "ndcg_at_k")
-    )
-
-    row = (
-        metrics_df.join(ndcg_df, "userId", "left")
-        .fillna(0.0, subset=["ndcg_at_k"])
         .agg(
-            F.avg("precision_at_k").alias("precision_at_k"),
-            F.avg("recall_at_k").alias("recall_at_k"),
-            F.avg("hit_rate").alias("hit_rate"),
+            F.avg("hit_at_1").alias("hit_at_1"),
+            F.avg("hit_at_5").alias("hit_at_5"),
+            F.avg("hit_at_10").alias("hit_at_10"),
+            F.avg("hit_at_20").alias("hit_at_20"),
             F.avg("ndcg_at_k").alias("ndcg_at_k"),
             F.count("*").alias("users_evaluated"),
         )
         .collect()[0]
     )
 
-    full_test_df.unpersist()
-
-    precision_at_k = float(row["precision_at_k"] or 0.0)
-    recall_at_k = float(row["recall_at_k"] or 0.0)
-    hit_rate = float(row["hit_rate"] or 0.0)
-    ndcg_at_k = float(row["ndcg_at_k"] or 0.0)
-    users_evaluated = int(row["users_evaluated"] or 0)
-
-    users_with_relevant = relevant_df.select("userId").distinct().count()
-    context.log.info(f"Users có relevant items trong test: {users_with_relevant} / {users_evaluated}")
+    positive_scored_rate = (
+        test_item_df
+        .join(
+            hybrid_df,
+            (test_item_df.userId == hybrid_df.userId) &
+            (test_item_df.test_movieId == hybrid_df.movieId),
+            "left_semi"
+        )
+        .count() / users_with_test
+    )
+    hit_at_1 = float(agg_row["hit_at_1"] or 0.0)
+    hit_at_5 = float(agg_row["hit_at_5"] or 0.0)
+    hit_at_10 = float(agg_row["hit_at_10"] or 0.0)
+    hit_at_20 = float(agg_row["hit_at_20"] or 0.0)
+    ndcg_at_k = float(agg_row["ndcg_at_k"] or 0.0)
+    users_evaluated = int(agg_row["users_evaluated"] or 0)
 
     context.log.info(
-        "Hybrid eval (alpha=%.2f): users=%s precision@%s=%.4f "
-        "recall@%s=%.4f hit_rate=%.4f ndcg@%s=%.4f",
-        HYBRID_ALPHA,
+        "Sampled hybrid eval (%s negatives): users=%s positive_scored_rate=%.4f "
+        "hit@1=%.4f hit@5=%.4f hit@10=%.4f hit@%s=%.4f ndcg@%s=%.4f",
+        NUM_NEGATIVES,
         users_evaluated,
+        positive_scored_rate,
+        hit_at_1,
+        hit_at_5,
+        hit_at_10,
         RECS_TOP_K,
-        precision_at_k,
-        RECS_TOP_K,
-        recall_at_k,
-        hit_rate,
+        hit_at_20,
         RECS_TOP_K,
         ndcg_at_k,
     )
 
+    hybrid_users_df.unpersist()
+    full_test_df.unpersist()
+    test_item_df.unpersist()
+    eval_users_df.unpersist()
+    candidate_pool_df.unpersist()
+    scored_df.unpersist()
+    positive_rank_df.unpersist()
+
     return MaterializeResult(
         metadata={
             "users_evaluated": MetadataValue.int(users_evaluated),
-            "precision_at_k": MetadataValue.float(precision_at_k),
-            "recall_at_k": MetadataValue.float(recall_at_k),
-            "hit_rate": MetadataValue.float(hit_rate),
+            "num_negatives": MetadataValue.int(NUM_NEGATIVES),
+            "positive_scored_rate": MetadataValue.float(positive_scored_rate),
+            "hit_at_1": MetadataValue.float(hit_at_1),
+            "hit_at_5": MetadataValue.float(hit_at_5),
+            "hit_at_10": MetadataValue.float(hit_at_10),
+            "hit_at_20": MetadataValue.float(hit_at_20),
             "ndcg_at_k": MetadataValue.float(ndcg_at_k),
-            "alpha_used": MetadataValue.float(HYBRID_ALPHA),
             "top_k": MetadataValue.int(RECS_TOP_K),
         }
     )
