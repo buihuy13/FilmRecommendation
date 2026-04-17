@@ -19,29 +19,30 @@ services:
       timeout: 5s
       retries: 10
 
-  # streamlit:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.streamlit
-  #   container_name: streamlit
-  #   ports:
-  #     - "8501:8501" 
-  #   env_file: ./.env
-  #   environment:
-  #     - TRINO_HOST=trino
-  #     - POSTGRES_HOST=${POSTGRES_HOST}
-  #     - POSTGRES_USER=${POSTGRES_USER}
-  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-  #     - POSTGRES_DB=${POSTGRES_DB} 
-  #   volumes:
-  #     - ./streamlit:/app
-  #     - ./pipeline/utils:/app/pipeline/utils
-  #   depends_on:
-  #     trino:
-  #       condition: service_healthy
-  #     postgres:
-  #       condition: service_healthy
-  #   restart: on-failure
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: streamlit
+    ports:
+      - "8501:8501"
+    env_file: ./.env
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - AWS_S3_ENDPOINT=${AWS_S3_ENDPOINT}
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_DRIVER_HOST=streamlit
+    volumes:
+      # - ./streamlit:/app/streamlit
+      # - ./pipeline:/app/pipeline
+      - ./jars:/opt/spark/extra-jars:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    restart: on-failure
   dagster:
     build:
       context: .

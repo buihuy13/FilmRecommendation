@@ -13,6 +13,7 @@ class SparkSessionResource(ConfigurableResource):
         minio_endpoint = os.getenv("AWS_S3_ENDPOINT", "http://minio:9000")
         minio_user = os.getenv("AWS_ACCESS_KEY_ID", "admin")
         minio_password = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+        driver_host = os.getenv("SPARK_DRIVER_HOST", "dagster")
 
         spark = (
             SparkSession.builder
@@ -21,7 +22,8 @@ class SparkSessionResource(ConfigurableResource):
             # Python version phải khớp giữa driver (Dagster) và executor (Spark workers)
             .config("spark.pyspark.python", "python3.10")
             .config("spark.pyspark.driver.python", "python3.10")
-            .config("spark.driver.host", "dagster")
+            .config("spark.driver.host", driver_host)
+            .config("spark.driver.bindAddress", "0.0.0.0")
             # Find hadoop packages
             .config("spark.driver.extraClassPath",
                     "/opt/spark/extra-jars/hadoop-aws-3.3.4.jar:"

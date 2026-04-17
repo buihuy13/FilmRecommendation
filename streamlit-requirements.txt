@@ -1,0 +1,6 @@
+streamlit>=1.44,<2.0
+pyspark==3.5.7
+pandas>=2.0,<3.0
+pyarrow
+python-dotenv
+dagster>=1.12.19,<2.0.0
