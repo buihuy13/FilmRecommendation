@@ -249,11 +249,7 @@ def _get_user_seen(ratings_df: DataFrame, user_means_df: DataFrame, active_users
     return user_seen
 
 # Tính điểm content-based cho các cặp (user, movie) dựa trên similarity giữa movie với các seed movies của user đó, cộng dồn điểm từ nhiều seed nếu có overlap
-def _iter_content_scores(
-    client: QdrantClient,
-    seed_movies: dict[int, list[int]],
-    user_seen: dict[int, set[int]],
-):
+def _iter_content_scores(client: QdrantClient, seed_movies: dict[int, list[int]],user_seen: dict[int, set[int]]):
     for user_id, seed_list in seed_movies.items():
         seen = user_seen[user_id]
         user_scores: dict[int, float] = {}
@@ -379,12 +375,12 @@ def _blend_and_rank(candidates_df: DataFrame, content_df: DataFrame) -> DataFram
             + F.lit(1.0 - HYBRID_ALPHA) * col("content_score"),
         )
     )
-    rank_w = Window.partitionBy("userId").orderBy(
-        F.desc("hybrid_score"),
-        F.desc("collab_score"),
-        F.desc("content_score"),
-        col("movieId"),
-    )
+    # rank_w = Window.partitionBy("userId").orderBy(
+    #     F.desc("hybrid_score"),
+    #     F.desc("collab_score"),
+    #     F.desc("content_score"),
+    #     col("movieId"),
+    # )
     # return (
     #     hybrid_df.withColumn("rank", F.row_number().over(rank_w))
     #     .filter(col("rank") <= HYBRID_TOP_K)
