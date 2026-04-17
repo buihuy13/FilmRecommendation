@@ -126,7 +126,7 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
     if hybrid_users_df.rdd.isEmpty():
         raise RuntimeError("No hybrid recommendations found to evaluate.")
 
-    # Positive item phải đến từ phần holdout thật của gold, không lấy từ toàn bộ lịch sử.
+    # Positive item (Item mà user thích)
     full_test_df = (
         _chronological_test_df(ratings_df)
         .join(hybrid_users_df, "userId", "inner")
@@ -148,9 +148,9 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
     eval_users_df = test_item_df.select("userId").cache()
     context.log.info(f"Users có test item: {eval_users_df.count()}")
 
-    # Retrieval coverage
-    users_with_test = test_item_df.count()
-    positive_retrieved = (
+    # Retrieval coverage (item-level)
+    test_items_count = test_item_df.count()
+    positive_retrieved_items = (
         test_item_df
         .join(hybrid_df,
               (test_item_df.userId == hybrid_df.userId) &
@@ -158,9 +158,33 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
               "inner")
         .count()
     )
+    item_retrieval_rate = (
+        positive_retrieved_items / test_items_count if test_items_count else 0.0
+    )
+
+    # Retrieval coverage (user-level): user được tính là retrieved nếu có ít nhất 1 test item match
+    users_with_test = test_item_df.select("userId").distinct().count()
+    users_with_positive_retrieved = (
+        test_item_df
+        .join(
+            hybrid_df,
+            (test_item_df.userId == hybrid_df.userId)
+            & (test_item_df.test_movieId == hybrid_df.movieId),
+            "left_semi",
+        )
+        .select(test_item_df.userId)
+        .distinct()
+        .count()
+    )
+    user_retrieval_rate = (
+        users_with_positive_retrieved / users_with_test if users_with_test else 0.0
+    )
+
     context.log.info(
-        f"Positive retrieved bởi model: {positive_retrieved}/{users_with_test} "
-        f"= {positive_retrieved/users_with_test:.4f}"
+        f"Positive retrieved (item-level): {positive_retrieved_items}/{test_items_count} "
+        f"= {item_retrieval_rate:.4f}; "
+        f"(user-level): {users_with_positive_retrieved}/{users_with_test} "
+        f"= {user_retrieval_rate:.4f}"
     )
 
     # Negative pool loại toàn bộ item user từng rate, để tránh lấy nhầm positive khác làm negative.
@@ -278,7 +302,9 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
             (test_item_df.test_movieId == hybrid_df.movieId),
             "left_semi"
         )
-        .count() / users_with_test
+        .count() / test_items_count
+        if test_items_count
+        else 0.0
     )
     hit_at_1 = float(agg_row["hit_at_1"] or 0.0)
     hit_at_5 = float(agg_row["hit_at_5"] or 0.0)

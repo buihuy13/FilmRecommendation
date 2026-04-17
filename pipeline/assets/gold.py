@@ -7,6 +7,7 @@ from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALS, ALSModel
 from pyspark.sql import DataFrame, SparkSession, Window, functions as F
 from pyspark.sql.functions import col
+from pyspark.storagelevel import StorageLevel
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
@@ -40,6 +41,7 @@ CONTENT_SYNOPSIS_WEIGHT = 0.7
 
 # Shared helpers
 
+# Chia train/test theo 80/20
 def _chronological_split(df: DataFrame) -> DataFrame:
     order_w = Window.partitionBy("userId").orderBy("timestamp", "movieId")
     stats_w = Window.partitionBy("userId")
@@ -83,7 +85,7 @@ def _build_train_test(ratings_df: DataFrame, user_means_df: DataFrame):
     )
     return train_df, test_df
 
-
+# Evaluate nhẹ cho ALS model
 def _evaluate_als(model, test_df: DataFrame, sample_fraction: float, context) -> tuple[float, int]:
     sample = test_df.sample(False, sample_fraction, seed=42)
     preds = model.transform(sample).withColumn(
@@ -99,6 +101,7 @@ def _evaluate_als(model, test_df: DataFrame, sample_fraction: float, context) ->
 
 # Qdrant helpers
 
+# Xóa và tạo lại qdrant collection
 def _recreate_qdrant_collection(client: QdrantClient) -> None:
     client.delete_collection(collection_name=QDRANT_COLLECTION)
     client.create_collection(
@@ -109,7 +112,7 @@ def _recreate_qdrant_collection(client: QdrantClient) -> None:
         },
     )
 
-
+# Thêm các vector và payload vào qdrant, batch theo size để tránh OOM
 def _upsert_rows(client: QdrantClient, full_df: DataFrame, context) -> int:
     points: list[PointStruct] = []
     count = 0
@@ -148,6 +151,7 @@ def _upsert_rows(client: QdrantClient, full_df: DataFrame, context) -> int:
 
 # Hybrid helpers
 
+# Xây dựng candidate từ ALS model, đưa về score thật, loại bỏ phim đã xem, z-score normalize, rank và limit
 def _build_collab_candidates(spark: SparkSession, model, active_users_df, 
                             user_means_df, user_seen: dict[int, set[int]]) -> DataFrame:
     candidates_df = (
@@ -164,7 +168,7 @@ def _build_collab_candidates(spark: SparkSession, model, active_users_df,
         .drop("_collab_raw", "user_mean")
     )
 
-    # Remove seen
+    # Remove movies mà user đã xem
     seen_rows = [(uid, mid) for uid, mids in user_seen.items() for mid in mids]
     seen_df = spark.createDataFrame(seen_rows, ["userId", "movieId"])
     candidates_df = candidates_df.join(seen_df, ["userId", "movieId"], "left_anti")
@@ -207,7 +211,7 @@ def _build_collab_candidates(spark: SparkSession, model, active_users_df,
 
     return candidates_df
 
-# Chưa normalize tránh user-bias
+# Lấy top N phim có rating cao nhất trong train set của mỗi user làm seed cho content-based part
 def _get_train_seed_movies(ratings_df: DataFrame, active_users: list[int]) -> dict[int, list[int]]:
     ranked = _chronological_split(ratings_df.filter(col("userId").isin(active_users)))
     history_rows = (
@@ -244,13 +248,16 @@ def _get_user_seen(ratings_df: DataFrame, user_means_df: DataFrame, active_users
         user_seen[row["userId"]].add(row["movieId"])
     return user_seen
 
-
-def _build_content_scores(client: QdrantClient, seed_movies: dict[int, list[int]], 
-                          user_seen: dict[int, set[int]]) -> list[tuple[int, int, float]]:
-    content_scores: dict[int, dict[int, float]] = defaultdict(dict)
-
+# Tính điểm content-based cho các cặp (user, movie) dựa trên similarity giữa movie với các seed movies của user đó, cộng dồn điểm từ nhiều seed nếu có overlap
+def _iter_content_scores(
+    client: QdrantClient,
+    seed_movies: dict[int, list[int]],
+    user_seen: dict[int, set[int]],
+):
     for user_id, seed_list in seed_movies.items():
         seen = user_seen[user_id]
+        user_scores: dict[int, float] = {}
+
         for seed_movie_id in seed_list:
             # Lấy vector của seed movie
             retrieved = client.retrieve(
@@ -296,22 +303,32 @@ def _build_content_scores(client: QdrantClient, seed_movies: dict[int, list[int]
                     )
 
             for movie_id, score in seed_candidate_scores.items():
-                prev = content_scores[user_id].get(movie_id, 0.0)
                 # Cần normalize lại content score sau khi cộng dồn
-                content_scores[user_id][movie_id] = prev + score
+                user_scores[movie_id] = user_scores.get(movie_id, 0.0) + score
 
-    return [
-        (user_id, movie_id, score)
-        for user_id, movies in content_scores.items()
-        for movie_id, score in movies.items()
-    ]
+        for movie_id, score in user_scores.items():
+            yield (user_id, movie_id, score)
 
 # normalize lại content score về [0,1]
-def _build_content_df(spark: SparkSession, content_rows: list[tuple]) -> DataFrame:
-    if not content_rows:
-        return spark.createDataFrame([], "userId int, movieId int, content_score double")
+def _build_content_df(spark: SparkSession, content_rows) -> DataFrame:
+    schema = "userId int, movieId int, content_score double"
+    batch_size = 50000
+    batch: list[tuple] = []
+    df = None
 
-    df = spark.createDataFrame(content_rows, ["userId", "movieId", "content_score"])
+    for row in content_rows:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            batch_df = spark.createDataFrame(batch, schema)
+            df = batch_df if df is None else df.unionByName(batch_df)
+            batch = []
+
+    if batch:
+        batch_df = spark.createDataFrame(batch, schema)
+        df = batch_df if df is None else df.unionByName(batch_df)
+
+    if df is None:
+        return spark.createDataFrame([], schema)
 
     # Window theo user
     mean_w = Window.partitionBy("userId")
@@ -344,7 +361,7 @@ def _build_content_df(spark: SparkSession, content_rows: list[tuple]) -> DataFra
 
     return df.drop("content_z")
 
-
+# Blend điểm collab và content, rank theo hybrid score, collab score, content score, movieId
 def _blend_and_rank(candidates_df: DataFrame, content_df: DataFrame) -> DataFrame:
     all_candidates = candidates_df.select("userId", "movieId").union(content_df.select("userId", "movieId")).dropDuplicates()
     hybrid_df = (
@@ -484,18 +501,19 @@ def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: 
     user_seen = _get_user_seen(ratings_df, user_means_df, active_users)
     candidates_df = _build_collab_candidates(spark, model, active_users_df, user_means_df, user_seen)
     candidates_df = candidates_df.filter(col("collab_score") > 0.2)
-    content_rows = _build_content_scores(client, seed_movies, user_seen)
+    content_rows = _iter_content_scores(client, seed_movies, user_seen)
     content_df = _build_content_df(spark, content_rows)
     final_df = _blend_and_rank(candidates_df, content_df)
 
     final_df.write.mode("overwrite").parquet(HYBRID_OUT_PATH)
 
-    final_df.persist()
+    final_df.persist(StorageLevel.DISK_ONLY)
     users_written = final_df.select("userId").distinct().count()
     rows_written = final_df.count()
     context.log.info(
         f"Saved {rows_written} hybrid recommendations for {users_written} active users."
     )
+    final_df.unpersist()
 
     return MaterializeResult(
         metadata={
