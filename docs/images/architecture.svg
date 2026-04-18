@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="860" viewBox="0 0 1400 860" role="img" aria-labelledby="title desc">
+  <title id="title">FilmRecommendation Architecture</title>
+  <desc id="desc">System architecture with user, Streamlit, Dagster, Spark cluster, MinIO, PostgreSQL, and Qdrant.</desc>
+  <defs>
+    <style>
+      .title { font: 700 28px 'Segoe UI', Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 600 18px 'Segoe UI', Arial, sans-serif; fill: #1e293b; }
+      .label { font: 600 16px 'Segoe UI', Arial, sans-serif; fill: #111827; }
+      .small { font: 500 13px 'Segoe UI', Arial, sans-serif; fill: #334155; }
+      .group { fill: #f8fafc; stroke: #94a3b8; stroke-width: 2; rx: 16; }
+      .svc { fill: #ffffff; stroke: #475569; stroke-width: 2; rx: 12; }
+      .store { fill: #fefce8; stroke: #a16207; stroke-width: 2; rx: 12; }
+      .compute { fill: #ecfeff; stroke: #0e7490; stroke-width: 2; rx: 12; }
+      .app { fill: #eff6ff; stroke: #1d4ed8; stroke-width: 2; rx: 12; }
+      .edge { stroke: #0f172a; stroke-width: 2.2; fill: none; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#0f172a" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="860" fill="#f1f5f9" />
+  <text class="title" x="700" y="44" text-anchor="middle">FilmRecommendation - System Architecture</text>
+
+  <rect class="group" x="50" y="90" width="310" height="150" />
+  <text class="subtitle" x="205" y="120" text-anchor="middle">Client Layer</text>
+  <rect class="svc" x="130" y="145" width="150" height="70" />
+  <text class="label" x="205" y="187" text-anchor="middle">User</text>
+
+  <rect class="group" x="410" y="90" width="430" height="280" />
+  <text class="subtitle" x="625" y="120" text-anchor="middle">Application Layer</text>
+  <rect class="app" x="450" y="150" width="350" height="90" />
+  <text class="label" x="625" y="185" text-anchor="middle">Streamlit App</text>
+  <text class="small" x="625" y="210" text-anchor="middle">Port 8501</text>
+  <rect class="app" x="450" y="255" width="350" height="90" />
+  <text class="label" x="625" y="290" text-anchor="middle">Dagster Webserver + Daemon</text>
+  <text class="small" x="625" y="315" text-anchor="middle">Port 3001</text>
+
+  <rect class="group" x="890" y="90" width="460" height="350" />
+  <text class="subtitle" x="1120" y="120" text-anchor="middle">Compute Layer</text>
+  <rect class="compute" x="930" y="150" width="380" height="90" />
+  <text class="label" x="1120" y="185" text-anchor="middle">Spark Master</text>
+  <text class="small" x="1120" y="210" text-anchor="middle">Ports 7077 (cluster), 8082 (UI)</text>
+  <rect class="compute" x="930" y="255" width="180" height="90" />
+  <text class="label" x="1020" y="290" text-anchor="middle">Spark Worker 1</text>
+  <text class="small" x="1020" y="315" text-anchor="middle">UI 8081</text>
+  <rect class="compute" x="1130" y="255" width="180" height="90" />
+  <text class="label" x="1220" y="290" text-anchor="middle">Spark Worker 2</text>
+  <text class="small" x="1220" y="315" text-anchor="middle">UI 8083</text>
+
+  <rect class="group" x="210" y="470" width="980" height="310" />
+  <text class="subtitle" x="700" y="500" text-anchor="middle">Storage and Serving Layer</text>
+
+  <rect class="store" x="260" y="540" width="270" height="120" />
+  <text class="label" x="395" y="580" text-anchor="middle">MinIO Data Lake</text>
+  <text class="small" x="395" y="605" text-anchor="middle">landing / bronze / silver / gold</text>
+  <text class="small" x="395" y="626" text-anchor="middle">Ports 9000 API, 9001 Console</text>
+
+  <rect class="store" x="565" y="540" width="270" height="120" />
+  <text class="label" x="700" y="580" text-anchor="middle">PostgreSQL</text>
+  <text class="small" x="700" y="605" text-anchor="middle">Dagster metadata storage</text>
+  <text class="small" x="700" y="626" text-anchor="middle">Port 5433 (host)</text>
+
+  <rect class="store" x="870" y="540" width="270" height="120" />
+  <text class="label" x="1005" y="580" text-anchor="middle">Qdrant Vector DB</text>
+  <text class="small" x="1005" y="605" text-anchor="middle">Hybrid content retrieval</text>
+  <text class="small" x="1005" y="626" text-anchor="middle">Port 6333 REST, 6334 gRPC</text>
+
+  <path class="edge" marker-end="url(#arrow)" d="M280 180 L450 180" />
+  <path class="edge" marker-end="url(#arrow)" d="M280 180 L450 300" />
+
+  <path class="edge" marker-end="url(#arrow)" d="M800 195 L930 195" />
+  <path class="edge" marker-end="url(#arrow)" d="M800 300 L930 195" />
+
+  <path class="edge" marker-end="url(#arrow)" d="M1120 240 L1020 255" />
+  <path class="edge" marker-end="url(#arrow)" d="M1120 240 L1220 255" />
+
+  <path class="edge" marker-end="url(#arrow)" d="M625 240 L395 540" />
+  <path class="edge" marker-end="url(#arrow)" d="M625 345 L700 540" />
+  <path class="edge" marker-end="url(#arrow)" d="M625 345 L1005 540" />
+  <path class="edge" marker-end="url(#arrow)" d="M1120 345 L395 540" />
+
+  <text class="small" x="700" y="740" text-anchor="middle">Dagster orchestrates Spark jobs. Streamlit serves online recommendations using Spark, MinIO, and Qdrant.</text>
+</svg>
