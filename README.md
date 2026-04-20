@@ -114,29 +114,55 @@ The flow image is available at `docs/images/spark-flow.png`.
 
 ### 1) Create environment file
 
-Create `.env` (note: current `.env.example` is empty) with values similar to:
+Create `.env` with values similar to (example):
 
 ```bash
 POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_DB=filmrec
+POSTGRES_PASSWORD=1
+POSTGRES_DB=dagster
+HIVE_METASTORE_DB=hive_metastore
+METABASE_DB=metabase
+POSTGRES_PORT=5433
 POSTGRES_HOST=postgres
-POSTGRES_PORT=5432
 CONTAINER_POSTGRES_PORT=5432
 
-DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${CONTAINER_POSTGRES_PORT}/${POSTGRES_DB}
 
-DAGSTER_ENV=dev
+DAGSTER_PORT=3001
+DAGSTER_ENV=development
 DAGSTER_HOME=/opt/dagster/dagster_home/dagster-project
 
+DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
+
+DAGSTER_DEPLOYMENT=local
+
+
+MINIO_ENDPOINT=minio:9000
+MINIO_PORT=9000
+MINIO_CONSOLE_PORT=9001
 MINIO_ROOT_USER=admin
 MINIO_ROOT_PASSWORD=admin123
+MINIO_BUCKET=datalake
+AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
 AWS_DEFAULT_REGION=us-east-1
 AWS_S3_ENDPOINT=http://minio:9000
 
-METABASE_DB=metabase
-HIVE_DB=hive
+SPARK_MODE=master
+SPARK_RPC_AUTHENTICATION_ENABLED=no
+SPARK_RPC_ENCRYPTION_ENABLED=no
+SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+SPARK_SSL_ENABLED=no
 
+SPARK_MODE=worker
+SPARK_MASTER_URL=spark://spark-master:7077
+SPARK_WORKER_MEMORY=2G
+SPARK_WORKER_CORES=2
+SPARK_RPC_AUTHENTICATION_ENABLED=no
+SPARK_RPC_ENCRYPTION_ENABLED=no
+SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+SPARK_SSL_ENABLED=no
+
+QDRANT_API_KEY=
 QDRANT_URL=http://qdrant:6333
 ```
 
@@ -192,14 +218,3 @@ The Streamlit app supports three serving modes:
 - `data/minio/bronze`: cleaned base data
 - `data/minio/silver`: feature vectors
 - `data/minio/gold`: trained artifacts and final recommendations
-
-## Common Issues
-
-- Spark cannot access MinIO:
-  - Verify `AWS_S3_ENDPOINT`, access key, and secret key in `.env`.
-  - Verify JAR files exist in `jars/`.
-- Dagster run fails due to metadata DB:
-  - Verify `POSTGRES_*`, `DATABASE_URL`, and Postgres health status.
-- No hybrid results in Streamlit:
-  - Ensure `gold_hybrid_recommendations` has been materialized.
-  - Ensure users have enough interactions (default threshold is >= 5).
