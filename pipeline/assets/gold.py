@@ -229,7 +229,7 @@ def _get_train_seed_movies(ratings_df: DataFrame, active_users: list[int]) -> di
             seeds.append(row["movieId"])
     return seed_movies
 
-# Lấy các film và active_user đã xem
+# Lấy các film mà active_user đã xem
 def _get_user_seen(ratings_df: DataFrame, user_means_df: DataFrame, active_users: list[int]) -> dict[int, set[int]]:
     ranked = _chronological_split(
         ratings_df.filter(col("userId").isin(active_users))

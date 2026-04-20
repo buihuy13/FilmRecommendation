@@ -17,6 +17,26 @@ Final recommendations are blended into a hybrid score and stored in the Gold lay
 
 The architecture image is available at `docs/images/architecture.svg`.
 
+## Service Screenshots
+
+### MinIO
+
+![MinIO Console](docs/images/minio.png)
+
+The MinIO screenshot is available at `docs/images/minio.png`.
+
+### Spark
+
+![Spark UI](docs/images/spark.png)
+
+The Spark screenshot is available at `docs/images/spark.png`.
+
+### Streamlit
+
+![Streamlit App](docs/images/streamlit.png)
+
+The Streamlit screenshot is available at `docs/images/streamlit.png`.
+
 ## Spark Pipeline Flow
 
 ![Spark Pipeline Flow](docs/images/spark-flow.png)

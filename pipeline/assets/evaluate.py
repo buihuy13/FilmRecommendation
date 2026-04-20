@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from dagster import AssetExecutionContext, MaterializeResult, MetadataValue, asset
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALSModel
@@ -106,7 +108,7 @@ def evaluate_als(context: AssetExecutionContext, spark_resource: SparkSessionRes
         }
     )
 
-
+# Sử dụng 3 positive items để đánh giá -> rate hit@K có thể cao hơn 1 tí (convention thường là 1)
 @asset(deps=[gold_hybrid_recommendations])
 def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
     import random
@@ -138,6 +140,7 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
         F.desc("timestamp"),
         F.desc("movieId"),
     )
+    # Mỗi user có trong hybrid lấy 3 rows làm test set
     test_item_df = (
         full_test_df.withColumn("rn", F.row_number().over(test_rank_w))
         .filter(col("rn") <= 3)
@@ -203,18 +206,19 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
     # Build sampled candidate pool: 1 positive + 99 negatives per user
     rng = random.Random(SAMPLE_SEED)
     sample_rows = []
-    test_item_map = {
-        row["userId"]: row["test_movieId"]
-        for row in test_item_df.collect()
-    }
+    test_item_map: dict[int, list[int]] = defaultdict(list)
+    for row in test_item_df.collect():
+        test_item_map[row["userId"]].append(row["test_movieId"])
 
-    for user_id, test_movie_id in test_item_map.items():
+    # Lấy NUM_NEGATIVES item ngẫu nhiên từ neg_pool (trừ đi đã rate và test item) -> random
+    for user_id, test_movie_ids in test_item_map.items():
         rated = user_rated.get(user_id, set())
-        neg_pool = list(all_movies_set - rated - {test_movie_id})
+        neg_pool = list(all_movies_set - rated - set(test_movie_ids))
         if len(neg_pool) < NUM_NEGATIVES:
             continue
         negatives = rng.sample(neg_pool, NUM_NEGATIVES)
-        sample_rows.append((user_id, test_movie_id, 1))
+        for test_movie_id in test_movie_ids: # 1 pool per positive item (best item)
+            sample_rows.append((user_id, test_movie_id, 1))
         for neg_id in negatives:
             sample_rows.append((user_id, neg_id, 0))
 
@@ -223,7 +227,6 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
     ).cache()
     context.log.info(f"Candidate pool: {candidate_pool_df.count()} rows")
 
-    # Vì gold chỉ lưu top-K cuối cùng, item không có score được coi là "không được retrieve".
     scored_df = (
         candidate_pool_df.alias("cand")
         .join(hybrid_df, ["userId", "movieId"], "left")
@@ -294,18 +297,6 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
         .collect()[0]
     )
 
-    positive_scored_rate = (
-        test_item_df
-        .join(
-            hybrid_df,
-            (test_item_df.userId == hybrid_df.userId) &
-            (test_item_df.test_movieId == hybrid_df.movieId),
-            "left_semi"
-        )
-        .count() / test_items_count
-        if test_items_count
-        else 0.0
-    )
     hit_at_1 = float(agg_row["hit_at_1"] or 0.0)
     hit_at_5 = float(agg_row["hit_at_5"] or 0.0)
     hit_at_10 = float(agg_row["hit_at_10"] or 0.0)
@@ -314,11 +305,10 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
     users_evaluated = int(agg_row["users_evaluated"] or 0)
 
     context.log.info(
-        "Sampled hybrid eval (%s negatives): users=%s positive_scored_rate=%.4f "
+        "Sampled hybrid eval (%s negatives): users=%s "
         "hit@1=%.4f hit@5=%.4f hit@10=%.4f hit@%s=%.4f ndcg@%s=%.4f",
         NUM_NEGATIVES,
         users_evaluated,
-        positive_scored_rate,
         hit_at_1,
         hit_at_5,
         hit_at_10,
@@ -340,7 +330,7 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
         metadata={
             "users_evaluated": MetadataValue.int(users_evaluated),
             "num_negatives": MetadataValue.int(NUM_NEGATIVES),
-            "positive_scored_rate": MetadataValue.float(positive_scored_rate),
+            "positive_scored_rate": MetadataValue.float(item_retrieval_rate),
             "hit_at_1": MetadataValue.float(hit_at_1),
             "hit_at_5": MetadataValue.float(hit_at_5),
             "hit_at_10": MetadataValue.float(hit_at_10),
