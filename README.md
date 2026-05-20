@@ -93,6 +93,9 @@ The flow image is available at `docs/images/spark-flow.png`.
   - Computes ALS quality metrics such as RMSE, MAE, and prediction coverage.
 - `evaluate_hybrid_sampled`
   - Computes sampled retrieval metrics such as Hit@K and NDCG@K.
+- `evaluate_candidate_coverage` (NEW)
+  - Diagnostics to track where test items are lost in the pipeline.
+  - Reports coverage at candidate pool, collab-only, content-only, and top-K levels.
 
 ## Tech Stack
 

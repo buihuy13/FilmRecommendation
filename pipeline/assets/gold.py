@@ -31,9 +31,9 @@ HYBRID_TOP_K = 20
 HYBRID_MAX_USERS = 400
 HYBRID_ALPHA = 0.75
 HIGH_RATING_THRESHOLD = 3.0
-CONTENT_SEEDS_PER_USER = 10
-CONTENT_CANDIDATES_PER_SEED = 500
-COLLAB_CANDIDATES_PER_USER = 1000
+CONTENT_SEEDS_PER_USER = 20
+CONTENT_CANDIDATES_PER_SEED = 1000
+COLLAB_CANDIDATES_PER_USER = 2000
 
 CONTENT_GENRE_WEIGHT = 0.3
 CONTENT_SYNOPSIS_WEIGHT = 0.7
@@ -361,32 +361,29 @@ def _build_content_df(spark: SparkSession, content_rows) -> DataFrame:
 def _blend_and_rank(candidates_df: DataFrame, content_df: DataFrame) -> DataFrame:
     all_candidates = candidates_df.select("userId", "movieId").union(content_df.select("userId", "movieId")).dropDuplicates()
     hybrid_df = (
-        #candidates_df
-        #.join(content_df, ["userId", "movieId"], "left")
-        #.union(content_df.select("userId", "movieId"))
         all_candidates
         .join(candidates_df, ["userId", "movieId"], "left")
         .join(content_df, ["userId", "movieId"], "left")
         .fillna(0.0)
-        #.fillna(0.0, subset=["content_score"])
         .withColumn(
             "hybrid_score",
             F.lit(HYBRID_ALPHA) * col("collab_score")
             + F.lit(1.0 - HYBRID_ALPHA) * col("content_score"),
         )
     )
-    # rank_w = Window.partitionBy("userId").orderBy(
-    #     F.desc("hybrid_score"),
-    #     F.desc("collab_score"),
-    #     F.desc("content_score"),
-    #     col("movieId"),
-    # )
-    # return (
-    #     hybrid_df.withColumn("rank", F.row_number().over(rank_w))
-    #     .filter(col("rank") <= HYBRID_TOP_K)
-    #     .drop("rank")
-    # )
-    return hybrid_df
+
+    # Apply ranking to pre-sort recommendations in the gold layer
+    rank_w = Window.partitionBy("userId").orderBy(
+        F.desc("hybrid_score"),
+        F.desc("collab_score"),
+        F.desc("content_score"),
+        F.asc("movieId"),
+    )
+    return (
+        hybrid_df.withColumn("rank", F.row_number().over(rank_w))
+        .filter(col("rank") <= HYBRID_TOP_K)
+        .drop("rank")
+    )
 
 
 # Dagster assets
@@ -496,7 +493,7 @@ def gold_hybrid_recommendations(context: AssetExecutionContext, spark_resource: 
     seed_movies = _get_train_seed_movies(ratings_df, active_users)
     user_seen = _get_user_seen(ratings_df, user_means_df, active_users)
     candidates_df = _build_collab_candidates(spark, model, active_users_df, user_means_df, user_seen)
-    candidates_df = candidates_df.filter(col("collab_score") > 0.2)
+    # Removed aggressive 0.2 threshold - keep all collaborative candidates for better coverage
     content_rows = _iter_content_scores(client, seed_movies, user_seen)
     content_df = _build_content_df(spark, content_rows)
     final_df = _blend_and_rank(candidates_df, content_df)
