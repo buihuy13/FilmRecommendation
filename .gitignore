@@ -64,3 +64,5 @@ data/
 *.jar
 
 spark-defaults.conf
+
+.claude

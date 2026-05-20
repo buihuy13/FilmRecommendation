@@ -22,7 +22,7 @@ from pipeline.resources.spark import SparkSessionResource
 BRONZE_RATINGS_PATH = "s3a://bronze/ratings/"
 EVAL_SAMPLE_FRACTION = 0.2
 RECS_TOP_K = HYBRID_TOP_K
-RECS_USER_SAMPLE = 1000
+RECS_USER_SAMPLE = 2000
 
 
 def _chronological_test_df(ratings_df: DataFrame) -> DataFrame:
@@ -337,5 +337,147 @@ def evaluate_hybrid_sampled(context: AssetExecutionContext, spark_resource: Spar
             "hit_at_20": MetadataValue.float(hit_at_20),
             "ndcg_at_k": MetadataValue.float(ndcg_at_k),
             "top_k": MetadataValue.int(RECS_TOP_K),
+        }
+    )
+
+@asset(deps=[gold_hybrid_recommendations])
+def evaluate_candidate_coverage(context: AssetExecutionContext, spark_resource: SparkSessionResource) -> MaterializeResult:
+    """
+    Diagnoses where in the pipeline test items are being lost.
+    Checks coverage at:
+    1. Test items that exist in the movie catalog
+    2. Test items that appear in hybrid recommendations (any score)
+    3. Test items that appear in top-K hybrid recommendations
+    """
+    from pipeline.assets.gold import (
+        HYBRID_OUT_PATH,
+        HYBRID_TOP_K,
+        HIGH_RATING_THRESHOLD,
+        _chronological_split,
+    )
+
+    spark = spark_resource.get_session()
+
+    # Read data
+    ratings_df = spark.read.parquet(BRONZE_RATINGS_PATH).select(
+        "userId", "movieId", "rating", "timestamp"
+    )
+    hybrid_df = spark.read.parquet(HYBRID_OUT_PATH).select(
+        "userId", "movieId", "hybrid_score", "collab_score", "content_score"
+    )
+
+    # Get test items from chronological split
+    test_df = (
+        _chronological_split(ratings_df)
+        .filter(
+            (col("user_event_count") >= 2) &
+            (col("row_num") > col("eval_cutoff")) &
+            (col("rating") >= HIGH_RATING_THRESHOLD)
+        )
+        .select("userId", "movieId", "rating")
+        .cache()
+    )
+
+    # Only consider users who have hybrid recommendations
+    hybrid_users = hybrid_df.select("userId").distinct()
+    test_df = test_df.join(hybrid_users, "userId", "inner")
+
+    total_test_items = test_df.count()
+    unique_test_users = test_df.select("userId").distinct().count()
+
+    # 1. Check how many test items are in hybrid recommendations (at any position)
+    test_in_hybrid_any = (
+        test_df.join(
+            hybrid_df,
+            ["userId", "movieId"],
+            "inner"
+        )
+        .select("userId", "movieId")
+        .distinct()
+        .count()
+    )
+
+    # 2. Check how many test items have ONLY collab score
+    test_has_collab = (
+        test_df.join(
+            hybrid_df.filter(col("collab_score") > 0),
+            ["userId", "movieId"],
+            "inner"
+        )
+        .select("userId", "movieId")
+        .distinct()
+        .count()
+    )
+
+    # 3. Check how many test items have ONLY content score
+    test_has_content = (
+        test_df.join(
+            hybrid_df.filter(col("content_score") > 0),
+            ["userId", "movieId"],
+            "inner"
+        )
+        .select("userId", "movieId")
+        .distinct()
+        .count()
+    )
+
+    # 4. Check how many test items are in top-K (with ranking)
+    # First, rank the hybrid recommendations per user
+    rank_w = Window.partitionBy("userId").orderBy(
+        F.desc("hybrid_score"),
+        F.desc("collab_score"),
+        F.desc("content_score"),
+        F.asc("movieId"),
+    )
+    hybrid_ranked = (
+        hybrid_df
+        .withColumn("rank", F.row_number().over(rank_w))
+        .filter(col("rank") <= HYBRID_TOP_K)
+        .select("userId", "movieId", "rank")
+    )
+
+    test_in_top_k = (
+        test_df.join(
+            hybrid_ranked,
+            ["userId", "movieId"],
+            "inner"
+        )
+        .select("userId", "movieId", "rank")
+        .cache()
+    )
+
+    test_in_top_k_count = test_in_top_k.count()
+
+    # Calculate average rank of test items that appear in top-K
+    avg_rank = (
+        test_in_top_k.agg(F.avg("rank").alias("avg_rank"))
+        .collect()[0]["avg_rank"]
+    ) if test_in_top_k_count > 0 else 0.0
+
+    # Calculate coverage percentages
+    any_coverage = (test_in_hybrid_any / total_test_items) if total_test_items else 0.0
+    collab_coverage = (test_has_collab / total_test_items) if total_test_items else 0.0
+    content_coverage = (test_has_content / total_test_items) if total_test_items else 0.0
+    top_k_coverage = (test_in_top_k_count / total_test_items) if total_test_items else 0.0
+
+    context.log.info(
+        f"Candidate Coverage: total_test={total_test_items} users={unique_test_users} "
+        f"any_coverage={any_coverage:.4f} collab_only={collab_coverage:.4f} "
+        f"content_only={content_coverage:.4f} top_k={top_k_coverage:.4f} "
+        f"avg_rank={avg_rank:.2f}"
+    )
+
+    test_df.unpersist()
+    test_in_top_k.unpersist()
+
+    return MaterializeResult(
+        metadata={
+            "total_test_items": MetadataValue.int(total_test_items),
+            "unique_test_users": MetadataValue.int(unique_test_users),
+            "any_hybrid_coverage": MetadataValue.float(any_coverage),
+            "collab_only_coverage": MetadataValue.float(collab_coverage),
+            "content_only_coverage": MetadataValue.float(content_coverage),
+            "top_k_coverage": MetadataValue.float(top_k_coverage),
+            "avg_rank_in_top_k": MetadataValue.float(avg_rank),
         }
     )
